@@ -215,8 +215,6 @@ resource "aws_instance" "dispatch" {
               fi
 
               cd Sprint2
-              git fetch origin ${local.branch}
-              git checkout ${local.branch}
 
               pip3 install --upgrade pip
               pip3 install -r requirements.txt
