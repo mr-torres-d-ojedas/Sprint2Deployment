@@ -204,11 +204,11 @@ resource "aws_instance" "dispatch" {
               export DATABASE_PASSWORD=despacho2025
               export DATABASE_PORT=5432
 
-              apt-get update -y
-              apt-get install -y python3-pip git build-essential libpq-dev python3-dev
+              sudo apt-get update -y
+              sudo apt-get install -y python3-pip git build-essential libpq-dev python3-dev
 
-              mkdir -p /labs
-              cd /labs
+              mkdir -p /experimento
+              cd /experimento
 
               if [ ! -d Sprint2 ]; then
                 git clone ${local.repository}
@@ -216,8 +216,8 @@ resource "aws_instance" "dispatch" {
 
               cd Sprint2
 
-              pip3 install --upgrade pip
-              pip3 install -r requirements.txt
+              sudo pip3 install --upgrade pip --break-system-packages
+              sudo pip3 install -r requirements.txt --break-system-packages
 
               # Migraciones
               python3 manage.py makemigrations
