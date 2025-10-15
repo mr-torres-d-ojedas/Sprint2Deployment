@@ -203,6 +203,7 @@ resource "aws_instance" "dispatch" {
     export DATABASE_PASSWORD=despacho2025
     export DATABASE_PORT=5432
 
+    # Instalar dependencias del sistema
     apt-get update -y
     apt-get install -y python3-pip git build-essential libpq-dev python3-dev
 
@@ -216,7 +217,7 @@ resource "aws_instance" "dispatch" {
 
     cd "$(basename ${local.repository} .git)"
 
-    pip3 install --upgrade pip --break-system-packages
+    # Usar pip del sistema sin actualizar
     pip3 install -r requirements.txt --break-system-packages
 
     # Migraciones
