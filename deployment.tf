@@ -40,7 +40,6 @@ provider "aws" {
 locals {
   project_name = "${var.project_prefix}-dispatch-platform"
   repository   = "https://github.com/mr-torres-d-ojedas/Sprint2.git"
-  branch       = "experimento"
 
   common_tags = {
     Project   = local.project_name
@@ -187,52 +186,52 @@ resource "aws_instance" "dispatch" {
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.traffic_dispatch.id, aws_security_group.traffic_ssh.id]
 
-  user_data = <<-EOT
-              #!/bin/bash
-              set -e
+    user_data = <<-EOT
+    #!/bin/bash
+    set -e
 
-              # Variables de base de datos (compartida)
-              echo "DATABASE_HOST=${aws_instance.database.private_ip}" >> /etc/environment
-              echo "DATABASE_NAME=dispatch_db" >> /etc/environment
-              echo "DATABASE_USER=dispatch_user" >> /etc/environment
-              echo "DATABASE_PASSWORD=despacho2025" >> /etc/environment
-              echo "DATABASE_PORT=5432" >> /etc/environment
+    # Variables de base de datos (compartida)
+    echo "DATABASE_HOST=${aws_instance.database.private_ip}" | tee -a /etc/environment
+    echo "DATABASE_NAME=dispatch_db" | tee -a /etc/environment
+    echo "DATABASE_USER=dispatch_user" | tee -a /etc/environment
+    echo "DATABASE_PASSWORD=despacho2025" | tee -a /etc/environment
+    echo "DATABASE_PORT=5432" | tee -a /etc/environment
 
-              export DATABASE_HOST=${aws_instance.database.private_ip}
-              export DATABASE_NAME=dispatch_db
-              export DATABASE_USER=dispatch_user
-              export DATABASE_PASSWORD=despacho2025
-              export DATABASE_PORT=5432
+    export DATABASE_HOST=${aws_instance.database.private_ip}
+    export DATABASE_NAME=dispatch_db
+    export DATABASE_USER=dispatch_user
+    export DATABASE_PASSWORD=despacho2025
+    export DATABASE_PORT=5432
 
-              sudo apt-get update -y
-              sudo apt-get install -y python3-pip git build-essential libpq-dev python3-dev
+    apt-get update -y
+    apt-get install -y python3-pip git build-essential libpq-dev python3-dev
 
-              mkdir -p /experimento
-              cd /experimento
+    mkdir -p /experimento
+    cd /experimento
 
-              if [ ! -d Sprint2 ]; then
-                git clone ${local.repository}
-              fi
+    # Clonar el repositorio solo si no existe
+    if [ ! -d "$(basename ${local.repository} .git)" ]; then
+        git clone ${local.repository}
+    fi
 
-              cd Sprint2
+    cd "$(basename ${local.repository} .git)"
 
-              sudo pip3 install --upgrade pip --break-system-packages
-              sudo pip3 install -r requirements.txt --break-system-packages
+    pip3 install --upgrade pip --break-system-packages
+    pip3 install -r requirements.txt --break-system-packages
 
-              # Migraciones
-              python3 manage.py makemigrations
-              python3 manage.py migrate
+    # Migraciones
+    python3 manage.py makemigrations
+    python3 manage.py migrate
 
-              # Ejecutar pobladores SOLO en la instancia 'a'
-              if [ "${each.key}" = "a" ]; then
-                echo "[populate] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
-                # Poblar productos/pedidos y despachos
-                python3 populate.py            >> /var/log/provision.log 2>&1 || true
-                python3 populateDespachos.py   >> /var/log/provision.log 2>&1 || true
-              else
-                echo "[populate] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
-              fi
-              EOT
+    # Ejecutar pobladores SOLO en la instancia 'a'
+    if [ "${each.key}" = "a" ]; then
+        echo "[populate] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
+        python3 populate.py >> /var/log/provision.log 2>&1 || true
+        python3 populateDespachos.py >> /var/log/provision.log 2>&1 || true
+    else
+        echo "[populate] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
+    fi
+    EOT
 
   tags = merge(local.common_tags, {
     Name = "${var.project_prefix}-dispatch-${each.key}"
