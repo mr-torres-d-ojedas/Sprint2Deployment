@@ -178,6 +178,7 @@ resource "aws_instance" "database" {
     Role = "database"
   })
 }
+
 resource "aws_instance" "dispatch" {
   for_each = toset(["a", "b"])
 
@@ -186,53 +187,60 @@ resource "aws_instance" "dispatch" {
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.traffic_dispatch.id, aws_security_group.traffic_ssh.id]
 
-    user_data = <<-EOT
-    #!/bin/bash
-    set -e
+  user_data = <<-EOT
+              #!/bin/bash
+              set -e
 
-    # Variables de base de datos (compartida)
-    echo "DATABASE_HOST=${aws_instance.database.private_ip}" | tee -a /etc/environment
-    echo "DATABASE_NAME=dispatch_db" | tee -a /etc/environment
-    echo "DATABASE_USER=dispatch_user" | tee -a /etc/environment
-    echo "DATABASE_PASSWORD=despacho2025" | tee -a /etc/environment
-    echo "DATABASE_PORT=5432" | tee -a /etc/environment
+              echo "[INIT] Iniciando configuración de instancia dispatch-${each.key}" | tee -a /var/log/provision.log
 
-    export DATABASE_HOST=${aws_instance.database.private_ip}
-    export DATABASE_NAME=dispatch_db
-    export DATABASE_USER=dispatch_user
-    export DATABASE_PASSWORD=despacho2025
-    export DATABASE_PORT=5432
+              # --- Variables de base de datos (compartidas) ---
+              echo "DATABASE_HOST=${aws_instance.database.private_ip}" | sudo tee -a /etc/environment
+              echo "DATABASE_NAME=dispatch_db" | sudo tee -a /etc/environment
+              echo "DATABASE_USER=dispatch_user" | sudo tee -a /etc/environment
+              echo "DATABASE_PASSWORD=despacho2025" | sudo tee -a /etc/environment
+              echo "DATABASE_PORT=5432" | sudo tee -a /etc/environment
 
-    # Instalar dependencias del sistema
-    apt-get update -y
-    apt-get install -y python3-pip git build-essential libpq-dev python3-dev
+              export DATABASE_HOST=${aws_instance.database.private_ip}
+              export DATABASE_NAME=dispatch_db
+              export DATABASE_USER=dispatch_user
+              export DATABASE_PASSWORD=despacho2025
+              export DATABASE_PORT=5432
 
-    mkdir -p /experimento
-    cd /experimento
+              # --- Instalación de dependencias del sistema ---
+              apt-get update -y
+              apt-get install -y python3-pip git build-essential libpq-dev python3-dev
 
-    # Clonar el repositorio solo si no existe
-    if [ ! -d "$(basename ${local.repository} .git)" ]; then
-        git clone ${local.repository}
-    fi
+              # --- Clonar el repositorio si no existe ---
+              mkdir -p /experimento
+              cd /experimento
 
-    cd "$(basename ${local.repository} .git)"
+              REPO_DIR=$(basename ${local.repository} .git)
+              if [ ! -d "$REPO_DIR" ]; then
+                git clone ${local.repository}
+              fi
 
-    # Usar pip del sistema sin actualizar
-    pip3 install -r requirements.txt --break-system-packages
+              cd "$REPO_DIR"
 
-    # Migraciones
-    python3 manage.py makemigrations
-    python3 manage.py migrate
+              # --- Instalar dependencias del proyecto ---
+              echo "[PYTHON] Instalando dependencias..." | tee -a /var/log/provision.log
+              pip3 install -r requirements.txt --break-system-packages
 
-    # Ejecutar pobladores SOLO en la instancia 'a'
-    if [ "${each.key}" = "a" ]; then
-        echo "[populate] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
-        python3 populate.py >> /var/log/provision.log 2>&1 || true
-        python3 populateDespachos.py >> /var/log/provision.log 2>&1 || true
-    else
-        echo "[populate] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
-    fi
-    EOT
+              # --- Migraciones de base de datos ---
+              echo "[DJANGO] Ejecutando migraciones..." | tee -a /var/log/provision.log
+              python3 manage.py makemigrations >> /var/log/provision.log 2>&1
+              python3 manage.py migrate >> /var/log/provision.log 2>&1
+
+              # --- Poblar datos solo en la instancia 'a' ---
+              if [ "${each.key}" = "a" ]; then
+                echo "[POPULATE] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
+                python3 populate.py >> /var/log/provision.log 2>&1 || true
+                python3 populateDespachos.py >> /var/log/provision.log 2>&1 || true
+              else
+                echo "[POPULATE] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
+              fi
+
+              echo "[OK] Provisionamiento completo en dispatch-${each.key}" | tee -a /var/log/provision.log
+              EOT
 
   tags = merge(local.common_tags, {
     Name = "${var.project_prefix}-dispatch-${each.key}"
