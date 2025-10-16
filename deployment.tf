@@ -1,18 +1,20 @@
-# ***************** Plataforma de Despachos ***********************
-# Infraestructura para el despliegue de la plataforma de despachos
+# ***************** Universidad de los Andes ***********************
+# ****** Departamento de Ingeniería de Sistemas y Computación ******
+# ********** Arquitectura y diseño de Software - Sprint2 ***********
+#
+# Infraestructura para la plataforma de despachos (Sprint2)
 #
 # Elementos a desplegar en AWS:
 # 1. Grupos de seguridad:
-#    - des-traffic-dispatch (puerto 8080)
+#    - des-traffic-django (puerto 8080)
 #    - des-traffic-kong (puertos 8000 y 8001)
 #    - des-traffic-db (puerto 5432)
 #    - des-traffic-ssh (puerto 22)
 #
 # 2. Instancias EC2:
-#    - des-kong
-#    - des-db (PostgreSQL instalado y configurado)
-#    - des-dispatch-a (Aplicación Django instalada)
-#    - des-dispatch-b (Aplicación Django instalada)
+#    - des-kong (Kong API Gateway)
+#    - des-db (PostgreSQL)
+#    - des-backend (Aplicación Django Sprint2)
 # ******************************************************************
 
 variable "region" {
@@ -22,13 +24,13 @@ variable "region" {
 }
 
 variable "project_prefix" {
-  description = "Prefix used for naming AWS resources"
+  description = "Prefix used for AWS resource names"
   type        = string
   default     = "des"
 }
 
 variable "instance_type" {
-  description = "EC2 instance type for application hosts"
+  description = "EC2 instance type"
   type        = string
   default     = "t2.nano"
 }
@@ -38,8 +40,8 @@ provider "aws" {
 }
 
 locals {
-  project_name = "${var.project_prefix}-dispatch-platform"
-  repository   = "https://github.com/mr-torres-d-ojedas/Sprint2.git"
+  project_name = "${var.project_prefix}-sprint2"
+  repository   = "https://github.com/mr-torres-d-ojedas/Sprint2.git" # <-- cámbialo a tu repo
 
   common_tags = {
     Project   = local.project_name
@@ -47,6 +49,9 @@ locals {
   }
 }
 
+# ------------------------------------------------------------
+# Imagen base (Ubuntu 24.04)
+# ------------------------------------------------------------
 data "aws_ami" "ubuntu" {
   most_recent = true
   owners      = ["099720109477"]
@@ -62,38 +67,37 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-resource "aws_security_group" "traffic_dispatch" {
-  name        = "${var.project_prefix}-traffic-dispatch"
-  description = "Allow application traffic on port 8080"
+# ------------------------------------------------------------
+# Grupos de seguridad
+# ------------------------------------------------------------
+
+resource "aws_security_group" "traffic_django" {
+  name        = "${var.project_prefix}-traffic-django"
+  description = "Allow Django traffic on port 8080"
 
   ingress {
-    description = "HTTP access for dispatch service"
+    description = "HTTP access"
     from_port   = 8080
     to_port     = 8080
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-traffic-dispatch"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-django" })
 }
 
 resource "aws_security_group" "traffic_kong" {
   name        = "${var.project_prefix}-traffic-kong"
-  description = "Expose Kong circuit breaker ports"
+  description = "Allow Kong traffic"
 
   ingress {
-    description = "Kong traffic"
     from_port   = 8000
     to_port     = 8001
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-traffic-kong"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-kong" })
 }
 
 resource "aws_security_group" "traffic_db" {
@@ -101,16 +105,13 @@ resource "aws_security_group" "traffic_db" {
   description = "Allow PostgreSQL access"
 
   ingress {
-    description = "Traffic from anywhere to DB"
     from_port   = 5432
     to_port     = 5432
     protocol    = "tcp"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-traffic-db"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-db" })
 }
 
 resource "aws_security_group" "traffic_ssh" {
@@ -118,7 +119,6 @@ resource "aws_security_group" "traffic_ssh" {
   description = "Allow SSH access"
 
   ingress {
-    description = "SSH access from anywhere"
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
@@ -126,161 +126,133 @@ resource "aws_security_group" "traffic_ssh" {
   }
 
   egress {
-    description = "Allow all outbound traffic"
     from_port   = 0
     to_port     = 0
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-traffic-ssh"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
 }
 
-resource "aws_instance" "kong" {
-  ami                         = data.aws_ami.ubuntu.id
-  instance_type               = var.instance_type
-  associate_public_ip_address = true
-  vpc_security_group_ids      = [aws_security_group.traffic_kong.id, aws_security_group.traffic_ssh.id]
-
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-kong"
-    Role = "circuit-breaker"
-  })
-}
-
+# ------------------------------------------------------------
+# Instancia: Base de datos PostgreSQL
+# ------------------------------------------------------------
 resource "aws_instance" "database" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   associate_public_ip_address = true
   vpc_security_group_ids      = [aws_security_group.traffic_db.id, aws_security_group.traffic_ssh.id]
 
-  user_data = <<-EOT
-              #!/bin/bash
-              set -e
+user_data = <<-EOT
+  #!/bin/bash
+  apt-get update -y
+  apt-get install -y postgresql postgresql-contrib
+  sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025';"
+  sudo -u postgres createdb -O dispatch_user dispatch_db
+  echo "host all all 0.0.0.0/0 trust" >> /etc/postgresql/16/main/pg_hba.conf
+  echo "listen_addresses='*'" >> /etc/postgresql/16/main/postgresql.conf
+  echo "max_connections=2000" >> /etc/postgresql/16/main/postgresql.conf
+  systemctl restart postgresql
+EOT
 
-              apt-get update -y
-              apt-get install -y postgresql postgresql-contrib
 
-              sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025';" || true
-              sudo -u postgres createdb -O dispatch_user dispatch_db || true
-
-              echo "host all all 0.0.0.0/0 trust" >> /etc/postgresql/16/main/pg_hba.conf
-              echo "listen_addresses='*'" >> /etc/postgresql/16/main/postgresql.conf
-              echo "max_connections=2000" >> /etc/postgresql/16/main/postgresql.conf
-
-              systemctl restart postgresql
-              EOT
-
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-db"
-    Role = "database"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-db" })
 }
 
-resource "aws_instance" "dispatch" {
-  for_each = toset(["a", "b"])
-
+  
+# ------------------------------------------------------------
+# Instancia: Django Sprint2 (CORREGIDO)
+# ------------------------------------------------------------
+resource "aws_instance" "backend" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   associate_public_ip_address = true
-  vpc_security_group_ids      = [aws_security_group.traffic_dispatch.id, aws_security_group.traffic_ssh.id]
+  vpc_security_group_ids      = [aws_security_group.traffic_django.id, aws_security_group.traffic_ssh.id]
+
+user_data = <<-EOT
+#!/bin/bash
+set -e
+echo "[INIT] Backend Sprint2 - $(date)" | tee -a /var/log/backend.log
+
+# ✅ Configuración de base de datos
+DB_IP="${aws_instance.database.private_ip}"
+echo "DATABASE_HOST=$DB_IP" >> /etc/environment
+export DATABASE_HOST=$DB_IP
+echo "[DB] $DB_IP OK" | tee -a /var/log/backend.log
+
+# ✅ Instalación de dependencias del sistema
+apt-get update -y
+apt-get install -y python3-pip python3-venv git build-essential libpq-dev python3-dev
+
+# ✅ Clonar proyecto
+mkdir -p /apps
+cd /apps
+git clone ${local.repository}
+cd Sprint2
+
+# ✅ Crear entorno virtual
+python3 -m venv /apps/Sprint2/venv
+
+# ✅ Instalar dependencias en el entorno virtual
+/apps/Sprint2/venv/bin/pip install --upgrade pip
+/apps/Sprint2/venv/bin/pip install -r requirements.txt
+/apps/Sprint2/venv/bin/pip install psycopg2-binary
+echo "[PIP] OK" | tee -a /var/log/backend.log
+
+# ✅ Migraciones
+/apps/Sprint2/venv/bin/python manage.py makemigrations | tee -a /var/log/backend.log
+/apps/Sprint2/venv/bin/python manage.py migrate | tee -a /var/log/backend.log
+echo "[MIGRATE] OK" | tee -a /var/log/backend.log
+
+# ✅ Poblar datos iniciales
+/apps/Sprint2/venv/bin/python populate.py | tee -a /var/log/backend.log || true
+/apps/Sprint2/venv/bin/python populateDespachos.py | tee -a /var/log/backend.log || true
+echo "[POPULATE] OK" | tee -a /var/log/backend.log
+
+# ✅ Levantar servidor Django
+nohup /apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080 > /var/log/django.log 2>&1 &
+echo "[DJANGO] 8080 OK" | tee -a /var/log/backend.log
+EOT
+
+
+  depends_on = [aws_instance.database]
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-backend" })
+}
+
+# ------------------------------------------------------------
+# Instancia: Kong (API Gateway)
+# ------------------------------------------------------------
+resource "aws_instance" "kong" {
+  ami                         = data.aws_ami.ubuntu.id
+  instance_type               = var.instance_type
+  associate_public_ip_address = true
+  vpc_security_group_ids      = [aws_security_group.traffic_kong.id, aws_security_group.traffic_ssh.id]
 
   user_data = <<-EOT
               #!/bin/bash
-              set -e
-
-              echo "[INIT] Iniciando configuración de instancia dispatch-${each.key}" | tee -a /var/log/provision.log
-
-              # --- Variables de base de datos (compartidas) ---
-              echo "DATABASE_HOST=${aws_instance.database.private_ip}" | sudo tee -a /etc/environment
-              echo "DATABASE_NAME=dispatch_db" | sudo tee -a /etc/environment
-              echo "DATABASE_USER=dispatch_user" | sudo tee -a /etc/environment
-              echo "DATABASE_PASSWORD=despacho2025" | sudo tee -a /etc/environment
-              echo "DATABASE_PORT=5432" | sudo tee -a /etc/environment
-
-              export DATABASE_HOST=${aws_instance.database.private_ip}
-              export DATABASE_NAME=dispatch_db
-              export DATABASE_USER=dispatch_user
-              export DATABASE_PASSWORD=despacho2025
-              export DATABASE_PORT=5432
-
-              # --- Instalación de dependencias del sistema ---
               apt-get update -y
-              apt-get install -y python3-pip git build-essential libpq-dev python3-dev python3-venv
-
-              # --- Clonar el repositorio si no existe ---
-              mkdir -p /experimento
-              cd /experimento
-
-              REPO_DIR=$(basename ${local.repository} .git)
-              if [ ! -d "$REPO_DIR" ]; then
-                git clone ${local.repository}
-              fi
-
-              cd "$REPO_DIR"
-
-              # *** VIRTUALENV - INSTALACIÓN LIMPIA Y SEGURA ***
-              echo "[VIRTUALENV] Creando entorno virtual..." | tee -a /var/log/provision.log
-              rm -rf venv  # Limpiar si existe
-              python3 -m venv venv
-              source venv/bin/activate
-
-              echo "[PIP] Actualizando pip..." | tee -a /var/log/provision.log
-              pip install --upgrade pip
-
-              echo "[PYTHON] Instalando dependencias..." | tee -a /var/log/provision.log
-              pip install -r requirements.txt
-
-              # *** ALIAS PARA FACILITAR COMANDOS ***
-              echo 'alias django="cd /experimento/Sprint2 && source venv/bin/activate && python manage.py"' >> /home/ubuntu/.bashrc
-              echo 'export PATH="/experimento/Sprint2/venv/bin:$PATH"' >> /home/ubuntu/.bashrc
-
-              # --- Migraciones de base de datos (CON VIRTUALENV ACTIVADO) ---
-              echo "[DJANGO] Ejecutando migraciones..." | tee -a /var/log/provision.log
-              source venv/bin/activate
-              python manage.py makemigrations >> /var/log/provision.log 2>&1
-              python manage.py migrate >> /var/log/provision.log 2>&1
-
-              # --- Poblar datos solo en la instancia 'a' (CON VIRTUALENV ACTIVADO) ---
-              if [ "${each.key}" = "a" ]; then
-                echo "[POPULATE] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
-                source venv/bin/activate
-                python populate.py >> /var/log/provision.log 2>&1 || true
-                python populateDespachos.py >> /var/log/provision.log 2>&1 || true
-              else
-                echo "[POPULATE] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
-              fi
-
-              echo "[OK] Provisionamiento completo en dispatch-${each.key}" | tee -a /var/log/provision.log
-              echo "[INFO] Usa: 'django migrate' o 'django runserver 0.0.0.0:8080'" | tee -a /var/log/provision.log
+              apt-get install -y docker.io docker-compose
+              systemctl start docker
+              systemctl enable docker
               EOT
 
-  tags = merge(local.common_tags, {
-    Name = "${var.project_prefix}-dispatch-${each.key}"
-    Role = "dispatch"
-  })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-kong" })
+}
 
-  depends_on = [aws_instance.database]
+# ------------------------------------------------------------
+# Salidas
+# ------------------------------------------------------------
+output "database_private_ip" {
+  value = aws_instance.database.private_ip
+}
+
+output "backend_public_ip" {
+  value = aws_instance.backend.public_ip
 }
 
 output "kong_public_ip" {
-  description = "Public IP address for the Kong circuit breaker instance"
-  value       = aws_instance.kong.public_ip
+  value = aws_instance.kong.public_ip
 }
 
-output "dispatch_public_ips" {
-  description = "Public IP addresses for the dispatch service instances"
-  value       = { for id, instance in aws_instance.dispatch : id => instance.public_ip }
-}
 
-output "dispatch_private_ips" {
-  description = "Private IP addresses for the dispatch service instances"
-  value       = { for id, instance in aws_instance.dispatch : id => instance.private_ip }
-}
-
-output "database_private_ip" {
-  description = "Private IP address for the PostgreSQL database instance"
-  value       = aws_instance.database.private_ip
-}
