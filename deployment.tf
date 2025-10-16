@@ -208,7 +208,7 @@ resource "aws_instance" "dispatch" {
 
               # --- Instalación de dependencias del sistema ---
               apt-get update -y
-              apt-get install -y python3-pip git build-essential libpq-dev python3-dev
+              apt-get install -y python3-pip git build-essential libpq-dev python3-dev python3-venv
 
               # --- Clonar el repositorio si no existe ---
               mkdir -p /experimento
@@ -221,25 +221,40 @@ resource "aws_instance" "dispatch" {
 
               cd "$REPO_DIR"
 
-              # --- Instalar dependencias del proyecto ---
+              # *** VIRTUALENV - INSTALACIÓN LIMPIA Y SEGURA ***
+              echo "[VIRTUALENV] Creando entorno virtual..." | tee -a /var/log/provision.log
+              rm -rf venv  # Limpiar si existe
+              python3 -m venv venv
+              source venv/bin/activate
+
+              echo "[PIP] Actualizando pip..." | tee -a /var/log/provision.log
+              pip install --upgrade pip
+
               echo "[PYTHON] Instalando dependencias..." | tee -a /var/log/provision.log
-              pip3 install -r requirements.txt --break-system-packages
+              pip install -r requirements.txt
 
-              # --- Migraciones de base de datos ---
+              # *** ALIAS PARA FACILITAR COMANDOS ***
+              echo 'alias django="cd /experimento/Sprint2 && source venv/bin/activate && python manage.py"' >> /home/ubuntu/.bashrc
+              echo 'export PATH="/experimento/Sprint2/venv/bin:$PATH"' >> /home/ubuntu/.bashrc
+
+              # --- Migraciones de base de datos (CON VIRTUALENV ACTIVADO) ---
               echo "[DJANGO] Ejecutando migraciones..." | tee -a /var/log/provision.log
-              python3 manage.py makemigrations >> /var/log/provision.log 2>&1
-              python3 manage.py migrate >> /var/log/provision.log 2>&1
+              source venv/bin/activate
+              python manage.py makemigrations >> /var/log/provision.log 2>&1
+              python manage.py migrate >> /var/log/provision.log 2>&1
 
-              # --- Poblar datos solo en la instancia 'a' ---
+              # --- Poblar datos solo en la instancia 'a' (CON VIRTUALENV ACTIVADO) ---
               if [ "${each.key}" = "a" ]; then
                 echo "[POPULATE] Ejecutando en instancia dispatch-a" | tee -a /var/log/provision.log
-                python3 populate.py >> /var/log/provision.log 2>&1 || true
-                python3 populateDespachos.py >> /var/log/provision.log 2>&1 || true
+                source venv/bin/activate
+                python populate.py >> /var/log/provision.log 2>&1 || true
+                python populateDespachos.py >> /var/log/provision.log 2>&1 || true
               else
                 echo "[POPULATE] Saltado en instancia dispatch-${each.key}" | tee -a /var/log/provision.log
               fi
 
               echo "[OK] Provisionamiento completo en dispatch-${each.key}" | tee -a /var/log/provision.log
+              echo "[INFO] Usa: 'django migrate' o 'django runserver 0.0.0.0:8080'" | tee -a /var/log/provision.log
               EOT
 
   tags = merge(local.common_tags, {
