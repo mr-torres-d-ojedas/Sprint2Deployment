@@ -33,13 +33,11 @@ variable "region" {
 
 variable "project_prefix" {
   description = "Prefix used for AWS resource names"
-  description = "Prefix used for AWS resource names"
   type        = string
   default     = "des"
 }
 
 variable "instance_type" {
-  description = "EC2 instance type"
   description = "EC2 instance type"
   type        = string
   default     = "t2.nano"
@@ -181,7 +179,6 @@ resource "aws_security_group" "traffic_ssh" {
     cidr_blocks = ["0.0.0.0/0"]
   }
 
-  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
   tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
 }
 
