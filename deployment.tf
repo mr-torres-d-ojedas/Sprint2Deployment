@@ -3,6 +3,11 @@
 # ********** Arquitectura y diseño de Software - Sprint2 ***********
 #
 # Infraestructura para la plataforma de despachos (Sprint2)
+# ***************** Universidad de los Andes ***********************
+# ****** Departamento de Ingeniería de Sistemas y Computación ******
+# ********** Arquitectura y diseño de Software - Sprint2 ***********
+#
+# Infraestructura para la plataforma de despachos (Sprint2)
 #
 # Elementos a desplegar en AWS:
 # 1. Grupos de seguridad:
@@ -28,11 +33,13 @@ variable "region" {
 
 variable "project_prefix" {
   description = "Prefix used for AWS resource names"
+  description = "Prefix used for AWS resource names"
   type        = string
   default     = "des"
 }
 
 variable "instance_type" {
+  description = "EC2 instance type"
   description = "EC2 instance type"
   type        = string
   default     = "t2.nano"
@@ -52,6 +59,9 @@ locals {
   }
 }
 
+# ------------------------------------------------------------
+# Imagen base (Ubuntu 24.04)
+# ------------------------------------------------------------
 # ------------------------------------------------------------
 # Imagen base (Ubuntu 24.04)
 # ------------------------------------------------------------
@@ -172,8 +182,12 @@ resource "aws_security_group" "traffic_ssh" {
   }
 
   tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
+  tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
 }
 
+# ------------------------------------------------------------
+# Instancia: Base de datos PostgreSQL
+# ------------------------------------------------------------
 # ------------------------------------------------------------
 # Instancia: Base de datos PostgreSQL
 # ------------------------------------------------------------
