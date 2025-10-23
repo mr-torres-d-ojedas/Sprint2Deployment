@@ -206,7 +206,7 @@ resource "aws_instance" "database" {
 #!/bin/bash
 apt-get update -y
 apt-get install -y postgresql postgresql-contrib
-sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025';"
+sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025' SUPERUSER;"
 sudo -u postgres createdb -O dispatch_user dispatch_db
 echo "host all all 0.0.0.0/0 trust" >> /etc/postgresql/16/main/pg_hba.conf
 echo "listen_addresses='*'" >> /etc/postgresql/16/main/postgresql.conf
@@ -340,11 +340,11 @@ EOT
 # }
 
 # ------------------------------------------------------------
-# Instancia EC2 para Kong (Circuit Breaker) - VERSIÓN ÚNICA CORREGIDA
+# Instancia EC2 para Kong (Circuit Breaker) - CORREGIDO
 # ------------------------------------------------------------
 resource "aws_instance" "kong" {
   ami                         = data.aws_ami.ubuntu.id
-  instance_type               = "t2.small" # Kong necesita más recursos
+  instance_type               = "t2.small"
   associate_public_ip_address = true
   vpc_security_group_ids      = [
     aws_security_group.traffic_cb.id, 
@@ -358,31 +358,50 @@ echo "[KONG] Iniciando instalación - $(date)" | tee -a /var/log/kong.log
 
 # Actualizar sistema
 apt-get update -y
-apt-get install -y curl wget apt-transport-https lsb-release ca-certificates
+apt-get install -y curl wget apt-transport-https gnupg2 ca-certificates lsb-release
 
 # Instalar PostgreSQL client
 apt-get install -y postgresql-client
 
-# Instalar Kong
-curl -Lo kong-3.5.0.amd64.deb "https://download.konghq.com/gateway-3.x-ubuntu-$(lsb_release -cs)/pool/all/k/kong/kong_3.5.0_amd64.deb"
-dpkg -i kong-3.5.0.amd64.deb || apt-get install -y -f
+# Agregar repositorio de Kong y descargar correctamente
+echo "deb [trusted=yes] https://download.konghq.com/gateway-3.x-ubuntu-$(lsb_release -cs)/ default all" | tee /etc/apt/sources.list.d/kong.list
+apt-get update -y
+apt-get install -y kong=3.5.0
 
-# Esperar a que la BD esté lista
-until PGPASSWORD=despacho2025 psql -h ${aws_instance.database.private_ip} -U dispatch_user -d dispatch_db -c '\q' 2>/dev/null; do
-  echo "Esperando PostgreSQL..." | tee -a /var/log/kong.log
+echo "[KONG] Kong instalado correctamente" | tee -a /var/log/kong.log
+
+# Esperar a que la BD esté lista (con timeout de 5 minutos)
+DB_IP="${aws_instance.database.private_ip}"
+echo "[KONG] Esperando PostgreSQL en $DB_IP..." | tee -a /var/log/kong.log
+
+timeout=300
+elapsed=0
+until PGPASSWORD=despacho2025 psql -h $DB_IP -U dispatch_user -d dispatch_db -c '\q' 2>/dev/null; do
+  if [ $elapsed -ge $timeout ]; then
+    echo "[KONG] ERROR: Timeout esperando PostgreSQL" | tee -a /var/log/kong.log
+    exit 1
+  fi
+  echo "[KONG] PostgreSQL no disponible aún, esperando..." | tee -a /var/log/kong.log
   sleep 5
+  elapsed=$((elapsed + 5))
 done
 
+echo "[KONG] PostgreSQL disponible" | tee -a /var/log/kong.log
+
 # Crear base de datos para Kong
-PGPASSWORD=despacho2025 psql -h ${aws_instance.database.private_ip} -U dispatch_user -d postgres <<SQL
+PGPASSWORD=despacho2025 psql -h $DB_IP -U dispatch_user -d postgres <<SQL
+SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kong_db';
+DROP DATABASE IF EXISTS kong_db;
 CREATE DATABASE kong_db;
-GRANT ALL PRIVILEGES ON DATABASE kong_db TO dispatch_user;
 SQL
 
+echo "[KONG] Base de datos kong_db creada" | tee -a /var/log/kong.log
+
 # Configurar Kong
+mkdir -p /etc/kong
 cat > /etc/kong/kong.conf <<CONF
 database = postgres
-pg_host = ${aws_instance.database.private_ip}
+pg_host = $DB_IP
 pg_port = 5432
 pg_user = dispatch_user
 pg_password = despacho2025
@@ -391,57 +410,112 @@ proxy_listen = 0.0.0.0:8000
 admin_listen = 0.0.0.0:8001
 CONF
 
+echo "[KONG] Configuración creada" | tee -a /var/log/kong.log
+
 # Migrar base de datos de Kong
-kong migrations bootstrap -c /etc/kong/kong.conf
+kong migrations bootstrap -c /etc/kong/kong.conf 2>&1 | tee -a /var/log/kong.log
 echo "[KONG] Migraciones completadas" | tee -a /var/log/kong.log
 
 # Iniciar Kong
-kong start -c /etc/kong/kong.conf
+kong start -c /etc/kong/kong.conf 2>&1 | tee -a /var/log/kong.log
 echo "[KONG] Kong iniciado en puerto 8000 (proxy) y 8001 (admin)" | tee -a /var/log/kong.log
 
-# Esperar a que Kong esté listo
-sleep 10
+# Esperar a que Kong esté completamente listo
+sleep 15
 
-# Configurar servicios y rutas para los backends
+# Verificar que Kong responde
+until curl -s http://localhost:8001 > /dev/null; do
+  echo "[KONG] Esperando a que Kong esté listo..." | tee -a /var/log/kong.log
+  sleep 3
+done
+
+echo "[KONG] Kong está listo para configuración" | tee -a /var/log/kong.log
+
+# IPs de los backends
 BACKEND_A_IP="${aws_instance.dispatch["a"].private_ip}"
 BACKEND_B_IP="${aws_instance.dispatch["b"].private_ip}"
 
-# Crear upstream (pool de backends)
-curl -i -X POST http://localhost:8001/upstreams \
+echo "[KONG] Backend A: $BACKEND_A_IP" | tee -a /var/log/kong.log
+echo "[KONG] Backend B: $BACKEND_B_IP" | tee -a /var/log/kong.log
+
+# Esperar a que los backends estén listos (verificar que Django responda)
+for BACKEND_IP in $BACKEND_A_IP $BACKEND_B_IP; do
+  timeout=300
+  elapsed=0
+  until curl -s "http://$BACKEND_IP:8080/despachos/reporte" > /dev/null 2>&1; do
+    if [ $elapsed -ge $timeout ]; then
+      echo "[KONG] WARNING: Backend $BACKEND_IP no responde, continuando de todas formas..." | tee -a /var/log/kong.log
+      break
+    fi
+    echo "[KONG] Esperando backend $BACKEND_IP..." | tee -a /var/log/kong.log
+    sleep 10
+    elapsed=$((elapsed + 10))
+  done
+done
+
+echo "[KONG] Configurando servicios..." | tee -a /var/log/kong.log
+
+# Crear upstream (pool de backends) con health checks
+curl -s -X POST http://localhost:8001/upstreams \
   --data name=backend-cluster \
   --data healthchecks.active.type=http \
-  --data healthchecks.active.http_path=/ \
+  --data healthchecks.active.http_path=/despachos/reporte \
+  --data healthchecks.active.timeout=5 \
   --data healthchecks.active.healthy.interval=10 \
   --data healthchecks.active.healthy.successes=2 \
   --data healthchecks.active.unhealthy.interval=10 \
-  --data healthchecks.active.unhealthy.http_failures=3
+  --data healthchecks.active.unhealthy.http_failures=3 \
+  --data healthchecks.active.unhealthy.timeouts=3 | tee -a /var/log/kong.log
+
+echo "" | tee -a /var/log/kong.log
 
 # Agregar targets (backends) al upstream
-curl -i -X POST http://localhost:8001/upstreams/backend-cluster/targets \
+curl -s -X POST http://localhost:8001/upstreams/backend-cluster/targets \
   --data target="$BACKEND_A_IP:8080" \
-  --data weight=100
+  --data weight=100 | tee -a /var/log/kong.log
 
-curl -i -X POST http://localhost:8001/upstreams/backend-cluster/targets \
+echo "" | tee -a /var/log/kong.log
+
+curl -s -X POST http://localhost:8001/upstreams/backend-cluster/targets \
   --data target="$BACKEND_B_IP:8080" \
-  --data weight=100
+  --data weight=100 | tee -a /var/log/kong.log
 
-# Crear servicio
-curl -i -X POST http://localhost:8001/services \
+echo "" | tee -a /var/log/kong.log
+
+# Crear servicio apuntando al upstream
+curl -s -X POST http://localhost:8001/services \
   --data name=dispatch-service \
   --data host=backend-cluster \
-  --data path=/
+  --data path=/despachos/reporte | tee -a /var/log/kong.log
 
-# Crear ruta
-curl -i -X POST http://localhost:8001/services/dispatch-service/routes \
-  --data paths[]=/
+echo "" | tee -a /var/log/kong.log
+
+# Crear ruta para acceso directo (sin prefijo adicional)
+curl -s -X POST http://localhost:8001/services/dispatch-service/routes \
+  --data "paths[]=/despachos/reporte" \
+  --data strip_path=false | tee -a /var/log/kong.log
+
+echo "" | tee -a /var/log/kong.log
+
+# OPCIONAL: Crear ruta raíz que redirija a /despachos/reporte
+curl -s -X POST http://localhost:8001/services/dispatch-service/routes \
+  --data "paths[]=/" \
+  --data strip_path=true | tee -a /var/log/kong.log
+
+echo "" | tee -a /var/log/kong.log
 
 # Habilitar plugin de Rate Limiting
-curl -i -X POST http://localhost:8001/plugins \
+curl -s -X POST http://localhost:8001/plugins \
   --data name=rate-limiting \
-  --data config.minute=100
+  --data config.minute=100 \
+  --data config.policy=local | tee -a /var/log/kong.log
 
-echo "[KONG] Configuración completada" | tee -a /var/log/kong.log
-echo "[KONG] Backends configurados: $BACKEND_A_IP:8080, $BACKEND_B_IP:8080" | tee -a /var/log/kong.log
+echo "" | tee -a /var/log/kong.log
+
+echo "[KONG] ===== CONFIGURACIÓN COMPLETADA =====" | tee -a /var/log/kong.log
+echo "[KONG] Backends: $BACKEND_A_IP:8080, $BACKEND_B_IP:8080" | tee -a /var/log/kong.log
+echo "[KONG] Ruta configurada: /despachos/reporte" | tee -a /var/log/kong.log
+echo "[KONG] Proxy URL: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8000/despachos/reporte" | tee -a /var/log/kong.log
 EOT
 
   depends_on = [
