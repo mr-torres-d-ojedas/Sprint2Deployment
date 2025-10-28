@@ -94,29 +94,6 @@ resource "aws_security_group" "traffic_django" {
   tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-django" })
 }
 
-# COMENTADO: Security group del ALB (no necesario sin Load Balancer)
-# resource "aws_security_group" "traffic_alb" {
-#   name        = "${var.project_prefix}-traffic-alb"
-#   description = "Allow HTTP traffic to Load Balancer"
-#
-#   ingress {
-#     description = "HTTP from anywhere"
-#     from_port   = 80
-#     to_port     = 80
-#     protocol    = "tcp"
-#     cidr_blocks = ["0.0.0.0/0"]
-#   }
-#
-#   egress {
-#     from_port   = 0
-#     to_port     = 0
-#     protocol    = "-1"
-#     cidr_blocks = ["0.0.0.0/0"]
-#   }
-#
-#   tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-alb" })
-# }
-
 resource "aws_security_group" "traffic_db" {
   name        = "${var.project_prefix}-traffic-db"
   description = "Allow PostgreSQL access"
@@ -159,7 +136,6 @@ resource "aws_security_group" "traffic_ssh" {
   tags = merge(local.common_tags, { Name = "${var.project_prefix}-traffic-ssh" })
 }
 
-# CORREGIDO: Agregado egress para que Kong pueda comunicarse con backends
 resource "aws_security_group" "traffic_cb" {
   name        = "${var.project_prefix}-traffic-cb"
   description = "Expose Kong circuit breaker ports"
@@ -206,12 +182,18 @@ resource "aws_instance" "database" {
 #!/bin/bash
 apt-get update -y
 apt-get install -y postgresql postgresql-contrib
+
+# Configurar PostgreSQL
 sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025' SUPERUSER;"
 sudo -u postgres createdb -O dispatch_user dispatch_db
-echo "host all all 0.0.0.0/0 trust" >> /etc/postgresql/16/main/pg_hba.conf
+
+# Configuración de acceso remoto
+echo "host all all 0.0.0.0/0 md5" >> /etc/postgresql/16/main/pg_hba.conf
 echo "listen_addresses='*'" >> /etc/postgresql/16/main/postgresql.conf
 echo "max_connections=2000" >> /etc/postgresql/16/main/postgresql.conf
+
 systemctl restart postgresql
+echo "[DB] PostgreSQL configurado correctamente" | tee -a /var/log/database.log
 EOT
 
   tags = merge(local.common_tags, { Name = "${var.project_prefix}-db" })
@@ -258,6 +240,9 @@ python3 -m venv /apps/Sprint2/venv
 /apps/Sprint2/venv/bin/pip install psycopg2-binary
 echo "[PIP] OK" | tee -a /var/log/backend.log
 
+# Esperar a que la BD esté lista
+sleep 30
+
 # Migraciones
 /apps/Sprint2/venv/bin/python manage.py makemigrations | tee -a /var/log/backend.log
 /apps/Sprint2/venv/bin/python manage.py migrate | tee -a /var/log/backend.log
@@ -271,73 +256,14 @@ echo "[POPULATE] OK" | tee -a /var/log/backend.log
 # Levantar servidor Django
 nohup /apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080 > /var/log/django.log 2>&1 &
 echo "[DJANGO] 8080 OK" | tee -a /var/log/backend.log
+
+# Crear archivo de estado para Kong
+echo "READY" > /tmp/backend_ready
 EOT
 
   depends_on = [aws_instance.database]
   tags       = merge(local.common_tags, { Name = "${var.project_prefix}-backend-${each.key}" })
 }
-
-# ------------------------------------------------------------
-# Application Load Balancer (ALB) - COMENTADO
-# ------------------------------------------------------------
-# NOTA: Si solo quieres usar Kong como balanceador, comenta todo este bloque
-# resource "aws_lb" "main" {
-#   name               = "${var.project_prefix}-alb"
-#   internal           = false
-#   load_balancer_type = "application"
-#   security_groups    = [aws_security_group.traffic_alb.id]
-#   subnets            = data.aws_subnets.default.ids
-#
-#   enable_deletion_protection = false
-#
-#   tags = merge(local.common_tags, { Name = "${var.project_prefix}-alb" })
-# }
-
-# ------------------------------------------------------------
-# Target Group (para los backends) - COMENTADO
-# ------------------------------------------------------------
-# resource "aws_lb_target_group" "backend" {
-#   name     = "${var.project_prefix}-backend-tg"
-#   port     = 8080
-#   protocol = "HTTP"
-#   vpc_id   = data.aws_vpc.default.id
-#
-#   health_check {
-#     enabled             = true
-#     healthy_threshold   = 2
-#     unhealthy_threshold = 2
-#     timeout             = 5
-#     interval            = 30
-#     path                = "/"
-#     matcher             = "200-399"
-#   }
-#
-#   tags = merge(local.common_tags, { Name = "${var.project_prefix}-backend-tg" })
-# }
-
-# Registrar instancias en el Target Group - COMENTADO
-# ------------------------------------------------------------
-# resource "aws_lb_target_group_attachment" "backend" {
-#   for_each = aws_instance.dispatch
-#
-#   target_group_arn = aws_lb_target_group.backend.arn
-#   target_id        = each.value.id
-#   port             = 8080
-# }
-
-# ------------------------------------------------------------
-# Listener del Load Balancer (puerto 80) - COMENTADO
-# ------------------------------------------------------------
-# resource "aws_lb_listener" "http" {
-#   load_balancer_arn = aws_lb.main.arn
-#   port              = "80"
-#   protocol          = "HTTP"
-#
-#   default_action {
-#     type             = "forward"
-#     target_group_arn = aws_lb_target_group.backend.arn
-#   }
-# }
 
 # ------------------------------------------------------------
 # Instancia EC2 para Kong (Circuit Breaker) - CORREGIDO
@@ -539,7 +465,7 @@ output "kong_public_ip" {
 
 output "kong_proxy_url" {
   description = "Kong Proxy URL (acceso principal a la aplicación)"
-  value       = "http://${aws_instance.kong.public_ip}:8000"
+  value       = "http://${aws_instance.kong.public_ip}:8000/despachos/reporte"
 }
 
 output "kong_admin_url" {
@@ -562,56 +488,63 @@ output "backend_public_ips" {
   value       = { for k, v in aws_instance.dispatch : k => v.public_ip }
 }
 
-# COMENTADO: Outputs del Load Balancer (no disponible sin ALB)
-# output "load_balancer_dns" {
-#   description = "DNS del Load Balancer"
-#   value       = aws_lb.main.dns_name
-# }
-
-# output "application_url" {
-#   description = "URL completa de tu aplicación"
-#   value       = "http://${aws_lb.main.dns_name}"
-# }
-
 output "instructions" {
   description = "Instrucciones de uso"
   value       = <<-INSTRUCTIONS
 
-🚀 DESPLIEGUE COMPLETADO EXITOSAMENTE (SIN ALB)
+🚀 DESPLIEGUE COMPLETADO EXITOSAMENTE
 
 🔀 ACCESO PRINCIPAL VÍA KONG (CIRCUIT BREAKER + LOAD BALANCER):
-   ✨ URL Principal: http://${aws_instance.kong.public_ip}:8000
-   🔧 Admin API:     http://${aws_instance.kong.public_ip}:8001
+   ✨ URL Principal: http://${aws_instance.kong.public_ip}:8000/despachos/reporte
+   🏠 URL Raíz (redirige): http://${aws_instance.kong.public_ip}:8000/
+   🔧 Admin API: http://${aws_instance.kong.public_ip}:8001
 
 🖥️  Backends directos (solo para pruebas/debugging):
-   Backend A: http://${aws_instance.dispatch["a"].public_ip}:8080
-   Backend B: http://${aws_instance.dispatch["b"].public_ip}:8080
+   Backend A: http://${aws_instance.dispatch["a"].public_ip}:8080/despachos/reporte
+   Backend B: http://${aws_instance.dispatch["b"].public_ip}:8080/despachos/reporte
 
 💾 Base de datos PostgreSQL:
    IP privada: ${aws_instance.database.private_ip}:5432
+   Usuario: dispatch_user
+   Base de datos: dispatch_db
 
 📊 KONG Configuration:
    ✅ Balanceo de carga entre 2 backends (Round Robin)
-   ✅ Health checks activos cada 10 segundos
+   ✅ Health checks activos en /despachos/reporte cada 10 segundos
    ⚡ Rate limiting: 100 peticiones/minuto
    🛡️  Circuit breaker: 3 fallos → circuit abierto
    🔄 Auto-recuperación de backends fallidos
 
-🔍 COMANDOS ÚTILES (desde Kong server o usando su IP pública):
+🔍 COMANDOS ÚTILES (verificación):
+   # Probar acceso vía Kong
+   curl http://${aws_instance.kong.public_ip}:8000/despachos/reporte
+   
    # Ver estado de backends
    curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/health
    
    # Ver servicios configurados
    curl http://${aws_instance.kong.public_ip}:8001/services
    
-   # Ver plugins activos
-   curl http://${aws_instance.kong.public_ip}:8001/plugins
+   # Ver rutas configuradas
+   curl http://${aws_instance.kong.public_ip}:8001/routes
    
    # Ver targets y su estado
    curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/targets
 
-📝 NOTA: Kong actúa como único punto de entrada (Circuit Breaker + Load Balancer)
-⏱️  Los servicios pueden tardar 2-3 minutos en estar completamente operativos
+🐛 DEBUG (si algo falla):
+   # Ver logs de Kong
+   ssh -i tu-key.pem ubuntu@${aws_instance.kong.public_ip}
+   tail -f /var/log/kong.log
+   tail -f /usr/local/kong/logs/error.log
+   
+   # Verificar estado de Kong
+   kong health
+
+📝 NOTAS:
+   - Kong tarda ~3-5 minutos en estar completamente operativo
+   - Los backends deben responder en /despachos/reporte para que el health check funcione
+   - Kong balanceará automáticamente las peticiones entre ambos backends
+   - Si un backend falla, Kong lo sacará del pool hasta que se recupere
 
 INSTRUCTIONS
 }
