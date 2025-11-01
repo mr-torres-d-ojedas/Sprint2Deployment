@@ -299,11 +299,11 @@ systemctl start docker
 echo "[DOCKER] Instalado OK" | tee -a /var/log/kong-setup.log
 
 # Crear directorio para configuración de Kong
-mkdir -p /etc/kong
-cd /etc/kong
+mkdir -p /opt/kong/declarative
+cd /opt/kong
 
 # Crear configuración declarativa de Kong
-cat > /etc/kong/kong.yml <<'KONGCONFIG'
+cat > /opt/kong/declarative/kong.yml <<'KONGCONFIG'
 _format_version: "2.1"
 
 # ============================================================
@@ -454,7 +454,7 @@ sleep 45
 docker run -d --name kong \
   --network=kong-net \
   --restart=unless-stopped \
-  -v /etc/kong:/kong/declarative/ \
+  -v /opt/kong/declarative:/kong/declarative/ \
   -e "KONG_DATABASE=off" \
   -e "KONG_DECLARATIVE_CONFIG=/kong/declarative/kong.yml" \
   -e "KONG_PROXY_ACCESS_LOG=/dev/stdout" \
