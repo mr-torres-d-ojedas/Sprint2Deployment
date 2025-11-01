@@ -266,7 +266,7 @@ EOT
 }
 
 # ------------------------------------------------------------
-# Instancia EC2 para Kong (Circuit Breaker) - CORREGIDO
+# Instancia EC2 para Kong (Circuit Breaker)
 # ------------------------------------------------------------
 resource "aws_instance" "kong" {
   ami                         = data.aws_ami.ubuntu.id
@@ -280,168 +280,209 @@ resource "aws_instance" "kong" {
   user_data = <<-EOT
 #!/bin/bash
 set -e
-echo "[KONG] Iniciando instalación - $(date)" | tee -a /var/log/kong.log
+echo "[INIT] Kong - $(date)" | tee -a /var/log/kong-setup.log
 
-# Actualizar sistema
-apt-get update -y
-apt-get install -y curl wget apt-transport-https gnupg2 ca-certificates lsb-release
+# Instalación de Docker
+apt-get update
+apt-get install -y ca-certificates curl gnupg lsb-release
 
-# Instalar PostgreSQL client
-apt-get install -y postgresql-client
+mkdir -m 0755 -p /etc/apt/keyrings
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
-# Agregar repositorio de Kong y descargar correctamente
-echo "deb [trusted=yes] https://download.konghq.com/gateway-3.x-ubuntu-$(lsb_release -cs)/ default all" | tee /etc/apt/sources.list.d/kong.list
-apt-get update -y
-apt-get install -y kong=3.5.0
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
-echo "[KONG] Kong instalado correctamente" | tee -a /var/log/kong.log
+apt-get update
+apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
-# Esperar a que la BD esté lista (con timeout de 5 minutos)
-DB_IP="${aws_instance.database.private_ip}"
-echo "[KONG] Esperando PostgreSQL en $DB_IP..." | tee -a /var/log/kong.log
+systemctl enable docker
+systemctl start docker
+echo "[DOCKER] Instalado OK" | tee -a /var/log/kong-setup.log
 
-timeout=300
-elapsed=0
-until PGPASSWORD=despacho2025 psql -h $DB_IP -U dispatch_user -d dispatch_db -c '\q' 2>/dev/null; do
-  if [ $elapsed -ge $timeout ]; then
-    echo "[KONG] ERROR: Timeout esperando PostgreSQL" | tee -a /var/log/kong.log
-    exit 1
-  fi
-  echo "[KONG] PostgreSQL no disponible aún, esperando..." | tee -a /var/log/kong.log
-  sleep 5
-  elapsed=$((elapsed + 5))
-done
-
-echo "[KONG] PostgreSQL disponible" | tee -a /var/log/kong.log
-
-# Crear base de datos para Kong
-PGPASSWORD=despacho2025 psql -h $DB_IP -U dispatch_user -d postgres <<SQL
-SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = 'kong_db';
-DROP DATABASE IF EXISTS kong_db;
-CREATE DATABASE kong_db;
-SQL
-
-echo "[KONG] Base de datos kong_db creada" | tee -a /var/log/kong.log
-
-# Configurar Kong
+# Crear directorio para configuración de Kong
 mkdir -p /etc/kong
-cat > /etc/kong/kong.conf <<CONF
-database = postgres
-pg_host = $DB_IP
-pg_port = 5432
-pg_user = dispatch_user
-pg_password = despacho2025
-pg_database = kong_db
-proxy_listen = 0.0.0.0:8000
-admin_listen = 0.0.0.0:8001
-CONF
+cd /etc/kong
 
-echo "[KONG] Configuración creada" | tee -a /var/log/kong.log
+# Crear configuración declarativa de Kong
+cat > /etc/kong/kong.yml <<'KONGCONFIG'
+_format_version: "2.1"
 
-# Migrar base de datos de Kong
-kong migrations bootstrap -c /etc/kong/kong.conf 2>&1 | tee -a /var/log/kong.log
-echo "[KONG] Migraciones completadas" | tee -a /var/log/kong.log
+# ============================================================
+# UPSTREAMS (Pool de backends con health checks)
+# ============================================================
+upstreams:
+  - name: backend-cluster
+    algorithm: round-robin
+    slots: 10000
+    healthchecks:
+      active:
+        type: http
+        http_path: /despachos/reporte
+        timeout: 5
+        concurrency: 10
+        healthy:
+          interval: 10
+          successes: 2
+          http_statuses:
+            - 200
+            - 302
+        unhealthy:
+          interval: 10
+          http_failures: 3
+          timeouts: 3
+          http_statuses:
+            - 429
+            - 500
+            - 503
+      passive:
+        type: http
+        healthy:
+          successes: 5
+          http_statuses:
+            - 200
+            - 201
+            - 302
+        unhealthy:
+          http_failures: 5
+          timeouts: 2
+          http_statuses:
+            - 429
+            - 500
+            - 503
+    tags:
+      - sprint2
+      - dispatch
 
-# Iniciar Kong
-kong start -c /etc/kong/kong.conf 2>&1 | tee -a /var/log/kong.log
-echo "[KONG] Kong iniciado en puerto 8000 (proxy) y 8001 (admin)" | tee -a /var/log/kong.log
+# ============================================================
+# TARGETS (Backends específicos)
+# ============================================================
+targets:
+  - target: "${aws_instance.dispatch["a"].private_ip}:8080"
+    upstream: backend-cluster
+    weight: 100
+    tags:
+      - backend-a
 
-# Esperar a que Kong esté completamente listo
-sleep 15
+  - target: "${aws_instance.dispatch["b"].private_ip}:8080"
+    upstream: backend-cluster
+    weight: 100
+    tags:
+      - backend-b
 
-# Verificar que Kong responde
-until curl -s http://localhost:8001 > /dev/null; do
-  echo "[KONG] Esperando a que Kong esté listo..." | tee -a /var/log/kong.log
-  sleep 3
-done
+# ============================================================
+# SERVICES
+# ============================================================
+services:
+  - name: dispatch-service
+    host: backend-cluster
+    port: 8080
+    protocol: http
+    connect_timeout: 60000
+    write_timeout: 60000
+    read_timeout: 60000
+    retries: 5
+    tags:
+      - sprint2
+      - dispatch
 
-echo "[KONG] Kong está listo para configuración" | tee -a /var/log/kong.log
+    routes:
+      - name: dispatch-report-route
+        paths:
+          - /despachos/reporte
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+        methods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - PATCH
+          - OPTIONS
+        tags:
+          - main-route
 
-# IPs de los backends
-BACKEND_A_IP="${aws_instance.dispatch["a"].private_ip}"
-BACKEND_B_IP="${aws_instance.dispatch["b"].private_ip}"
+      - name: dispatch-root-route
+        paths:
+          - /
+        strip_path: false
+        preserve_host: false
+        protocols:
+          - http
+        methods:
+          - GET
+        tags:
+          - root-route
 
-echo "[KONG] Backend A: $BACKEND_A_IP" | tee -a /var/log/kong.log
-echo "[KONG] Backend B: $BACKEND_B_IP" | tee -a /var/log/kong.log
+# ============================================================
+# PLUGINS GLOBALES
+# ============================================================
+plugins:
+  - name: rate-limiting
+    enabled: true
+    config:
+      minute: 100
+      policy: local
+      fault_tolerant: true
+      hide_client_headers: false
+    tags:
+      - rate-limiting
+      - protection
 
-# Esperar a que los backends estén listos (verificar que Django responda)
-for BACKEND_IP in $BACKEND_A_IP $BACKEND_B_IP; do
-  timeout=300
-  elapsed=0
-  until curl -s "http://$BACKEND_IP:8080/despachos/reporte" > /dev/null 2>&1; do
-    if [ $elapsed -ge $timeout ]; then
-      echo "[KONG] WARNING: Backend $BACKEND_IP no responde, continuando de todas formas..." | tee -a /var/log/kong.log
-      break
-    fi
-    echo "[KONG] Esperando backend $BACKEND_IP..." | tee -a /var/log/kong.log
-    sleep 10
-    elapsed=$((elapsed + 10))
-  done
-done
+  - name: correlation-id
+    enabled: true
+    config:
+      header_name: X-Kong-Request-ID
+      generator: uuid
+      echo_downstream: true
+    tags:
+      - observability
+KONGCONFIG
 
-echo "[KONG] Configurando servicios..." | tee -a /var/log/kong.log
 
-# Crear upstream (pool de backends) con health checks
-curl -s -X POST http://localhost:8001/upstreams \
-  --data name=backend-cluster \
-  --data healthchecks.active.type=http \
-  --data healthchecks.active.http_path=/despachos/reporte \
-  --data healthchecks.active.timeout=5 \
-  --data healthchecks.active.healthy.interval=10 \
-  --data healthchecks.active.healthy.successes=2 \
-  --data healthchecks.active.unhealthy.interval=10 \
-  --data healthchecks.active.unhealthy.http_failures=3 \
-  --data healthchecks.active.unhealthy.timeouts=3 | tee -a /var/log/kong.log
+echo "[CONFIG] Kong YML creado" | tee -a /var/log/kong-setup.log
 
-echo "" | tee -a /var/log/kong.log
+# Crear red Docker para Kong
+docker network create kong-net 2>/dev/null || true
+echo "[DOCKER] Red kong-net creada" | tee -a /var/log/kong-setup.log
 
-# Agregar targets (backends) al upstream
-curl -s -X POST http://localhost:8001/upstreams/backend-cluster/targets \
-  --data target="$BACKEND_A_IP:8080" \
-  --data weight=100 | tee -a /var/log/kong.log
+# Esperar a que los backends estén listos
+echo "[WAIT] Esperando backends..." | tee -a /var/log/kong-setup.log
+sleep 45
 
-echo "" | tee -a /var/log/kong.log
+# Levantar Kong
+docker run -d --name kong \
+  --network=kong-net \
+  --restart=unless-stopped \
+  -v /etc/kong:/kong/declarative/ \
+  -e "KONG_DATABASE=off" \
+  -e "KONG_DECLARATIVE_CONFIG=/kong/declarative/kong.yml" \
+  -e "KONG_PROXY_ACCESS_LOG=/dev/stdout" \
+  -e "KONG_ADMIN_ACCESS_LOG=/dev/stdout" \
+  -e "KONG_PROXY_ERROR_LOG=/dev/stderr" \
+  -e "KONG_ADMIN_ERROR_LOG=/dev/stderr" \
+  -e "KONG_ADMIN_LISTEN=0.0.0.0:8001" \
+  -e "KONG_ADMIN_GUI_URL=http://0.0.0.0:8002" \
+  -p 8000:8000 \
+  -p 8001:8001 \
+  -p 8002:8002 \
+  kong/kong-gateway:2.7.2.0-alpine
 
-curl -s -X POST http://localhost:8001/upstreams/backend-cluster/targets \
-  --data target="$BACKEND_B_IP:8080" \
-  --data weight=100 | tee -a /var/log/kong.log
+echo "[KONG] Contenedor iniciado" | tee -a /var/log/kong-setup.log
 
-echo "" | tee -a /var/log/kong.log
+# Verificar que Kong esté corriendo
+sleep 10
+if docker ps | grep -q kong; then
+  echo "[SUCCESS] Kong está corriendo" | tee -a /var/log/kong-setup.log
+  docker ps | tee -a /var/log/kong-setup.log
+else
+  echo "[ERROR] Kong no está corriendo" | tee -a /var/log/kong-setup.log
+  docker logs kong | tee -a /var/log/kong-setup.log
+fi
 
-# Crear servicio apuntando al upstream
-curl -s -X POST http://localhost:8001/services \
-  --data name=dispatch-service \
-  --data host=backend-cluster \
-  --data path=/despachos/reporte | tee -a /var/log/kong.log
-
-echo "" | tee -a /var/log/kong.log
-
-# Crear ruta para acceso directo (sin prefijo adicional)
-curl -s -X POST http://localhost:8001/services/dispatch-service/routes \
-  --data "paths[]=/despachos/reporte" \
-  --data strip_path=false | tee -a /var/log/kong.log
-
-echo "" | tee -a /var/log/kong.log
-
-# OPCIONAL: Crear ruta raíz que redirija a /despachos/reporte
-curl -s -X POST http://localhost:8001/services/dispatch-service/routes \
-  --data "paths[]=/" \
-  --data strip_path=true | tee -a /var/log/kong.log
-
-echo "" | tee -a /var/log/kong.log
-
-# Habilitar plugin de Rate Limiting
-curl -s -X POST http://localhost:8001/plugins \
-  --data name=rate-limiting \
-  --data config.minute=100 \
-  --data config.policy=local | tee -a /var/log/kong.log
-
-echo "" | tee -a /var/log/kong.log
-
-echo "[KONG] ===== CONFIGURACIÓN COMPLETADA =====" | tee -a /var/log/kong.log
-echo "[KONG] Backends: $BACKEND_A_IP:8080, $BACKEND_B_IP:8080" | tee -a /var/log/kong.log
-echo "[KONG] Ruta configurada: /despachos/reporte" | tee -a /var/log/kong.log
-echo "[KONG] Proxy URL: http://$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4):8000/despachos/reporte" | tee -a /var/log/kong.log
+# Crear archivo de estado
+echo "READY" > /tmp/kong_ready
+echo "[COMPLETE] Setup finalizado - $(date)" | tee -a /var/log/kong-setup.log
 EOT
 
   depends_on = [
