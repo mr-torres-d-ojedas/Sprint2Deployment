@@ -170,6 +170,48 @@ resource "aws_security_group" "traffic_cb" {
 }
 
 # ------------------------------------------------------------
+# Variable para email del manager
+# ------------------------------------------------------------
+variable "manager_email" {
+  description = "Email del manager para recibir alertas"
+  type        = string
+  default     = "dsfafflmao@gmail.com"  # CAMBIAR POR EMAIL REAL
+}
+
+# ------------------------------------------------------------
+# SNS Topic para alertas
+# ------------------------------------------------------------
+resource "aws_sns_topic" "backend_alerts" {
+  name         = "${var.project_prefix}-backend-alerts"
+  display_name = "Backend Health Alerts"
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_prefix}-backend-alerts"
+  })
+}
+
+resource "aws_sns_topic_subscription" "manager_email" {
+  topic_arn = aws_sns_topic.backend_alerts.arn
+  protocol  = "email"
+  endpoint  = var.manager_email
+}
+
+
+# ------------------------------------------------------------
+# Usar LabRole existente en lugar de crear uno nuevo
+# ------------------------------------------------------------
+data "aws_iam_role" "lab_role" {
+  name = "LabRole"
+}
+
+data "aws_iam_instance_profile" "lab_profile" {
+  name = "LabInstanceProfile"
+}
+
+
+
+
+# ------------------------------------------------------------
 # Instancia: Base de datos PostgreSQL
 # ------------------------------------------------------------
 resource "aws_instance" "database" {
@@ -200,10 +242,10 @@ EOT
 }
 
 # ------------------------------------------------------------
-# Instancias: Django Sprint2 (2 réplicas: a y b)
+# Instancias: Django Sprint2 (2 réplicas: a, b y c)
 # ------------------------------------------------------------
 resource "aws_instance" "dispatch" {
-  for_each = toset(["a", "b"])
+  for_each = toset(["a", "b", "c"])
 
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
@@ -272,6 +314,7 @@ resource "aws_instance" "kong" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = "t2.small"
   associate_public_ip_address = true
+  iam_instance_profile        = data.aws_iam_instance_profile.lab_profile.name
   vpc_security_group_ids      = [
     aws_security_group.traffic_cb.id, 
     aws_security_group.traffic_ssh.id
@@ -282,20 +325,32 @@ resource "aws_instance" "kong" {
 set -e
 echo "[INIT] Kong - $(date)" | tee -a /var/log/kong-setup.log
 
-# Instalación de Docker
+# Instalación de dependencias básicas
 apt-get update
-apt-get install -y ca-certificates curl gnupg lsb-release
+DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip curl ca-certificates gnupg lsb-release
+echo "[DEPS] Dependencias básicas instaladas" | tee -a /var/log/kong-setup.log
 
+# Instalar AWS CLI v2 (método oficial para Ubuntu 24.04)
+cd /tmp
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+rm -rf aws awscliv2.zip
+/usr/local/bin/aws --version | tee -a /var/log/kong-setup.log
+echo "[AWS-CLI] Instalado OK" | tee -a /var/log/kong-setup.log
+
+# Instalación de Docker
 mkdir -m 0755 -p /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
 apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 systemctl enable docker
 systemctl start docker
+docker --version | tee -a /var/log/kong-setup.log
 echo "[DOCKER] Instalado OK" | tee -a /var/log/kong-setup.log
 
 # Crear directorio para configuración de Kong
@@ -348,6 +403,7 @@ upstreams:
             - 429
             - 500
             - 503
+      threshold: 33
     tags:
       - sprint2
       - dispatch
@@ -367,6 +423,12 @@ targets:
     weight: 100
     tags:
       - backend-b
+    
+  - target: "${aws_instance.dispatch["c"].private_ip}:8080"
+    upstream: backend-cluster
+    weight: 100
+    tags:
+      - backend-c
 
 # ============================================================
 # SERVICES
@@ -429,6 +491,15 @@ plugins:
       - rate-limiting
       - protection
 
+  - name: request-termination
+    service: dispatch-service
+    enabled: false
+    config:
+      status_code: 503
+      message: "Service Degraded: Limited capacity available"
+    tags:
+      - degradation
+
   - name: correlation-id
     enabled: true
     config:
@@ -439,8 +510,132 @@ plugins:
       - observability
 KONGCONFIG
 
-
 echo "[CONFIG] Kong YML creado" | tee -a /var/log/kong-setup.log
+
+# Script de monitoreo de degradación
+cat > /opt/kong/monitor_health.sh <<'MONITOR'
+#!/bin/bash
+# Script de monitoreo de health de backends
+
+KONG_ADMIN="http://localhost:8001"
+SNS_TOPIC_ARN="${aws_sns_topic.backend_alerts.arn}"
+ALERT_SENT_FILE="/tmp/degradation_alert_sent"
+
+# Obtener la IP pública de esta instancia
+KONG_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+while true; do
+  # Obtener estado de targets
+  HEALTH_JSON=$(curl -s "$KONG_ADMIN/upstreams/backend-cluster/health")
+  
+  TOTAL=$(echo "$HEALTH_JSON" | jq '.data | length')
+  HEALTHY=$(echo "$HEALTH_JSON" | jq '[.data[] | select(.health == "HEALTHY")] | length')
+  
+  echo "[$(date)] Total: $TOTAL, Healthy: $HEALTHY" >> /var/log/kong-monitor.log
+  
+  # Lógica de degradación
+  if [ "$HEALTHY" -eq 1 ] && [ "$TOTAL" -eq 3 ]; then
+    echo "[DEGRADED] Solo 1 backend activo de 3" >> /var/log/kong-monitor.log
+    
+    if [ ! -f "$ALERT_SENT_FILE" ]; then
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "⚠️ ALERTA: Sistema en Modo Degradado" \
+        --message "ALERTA CRÍTICA: Solo 1 de 3 backends está operativo.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+El sistema continúa operando pero con capacidad limitada.
+Se recomienda revisar los backends caídos inmediatamente.
+
+Backends:
+- Backend A: ${aws_instance.dispatch["a"].private_ip}
+- Backend B: ${aws_instance.dispatch["b"].private_ip}
+- Backend C: ${aws_instance.dispatch["c"].private_ip}
+
+Para verificar estado:
+curl http://$KONG_PUBLIC_IP:8001/upstreams/backend-cluster/health" \
+        --region ${var.region}
+      
+      touch "$ALERT_SENT_FILE"
+      echo "[ALERT] Notificación enviada" >> /var/log/kong-monitor.log
+    fi
+    
+  elif [ "$HEALTHY" -eq 0 ]; then
+    echo "[CRITICAL] Todos los backends caídos" >> /var/log/kong-monitor.log
+    
+    /usr/local/bin/aws sns publish \
+      --topic-arn "$SNS_TOPIC_ARN" \
+      --subject "🚨 CRÍTICO: Sistema Completamente Caído" \
+      --message "ALERTA CRÍTICA: Todos los backends están caídos.
+
+Backends activos: 0/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+El sistema NO está operativo. Se requiere intervención inmediata.
+
+Backends:
+- Backend A: ${aws_instance.dispatch["a"].private_ip}
+- Backend B: ${aws_instance.dispatch["b"].private_ip}
+- Backend C: ${aws_instance.dispatch["c"].private_ip}
+
+Acciones recomendadas:
+1. Verificar logs de backends
+2. Reiniciar servicios Django
+3. Verificar conectividad de red" \
+      --region ${var.region}
+      
+  else
+    if [ -f "$ALERT_SENT_FILE" ]; then
+      rm -f "$ALERT_SENT_FILE"
+      
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "✅ RECUPERACIÓN: Sistema Operativo Normal" \
+        --message "El sistema ha vuelto a la normalidad.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+Todos los backends están operativos nuevamente." \
+        --region ${var.region}
+      
+      echo "[RECOVERY] Sistema recuperado, notificación enviada" >> /var/log/kong-monitor.log
+    fi
+  fi
+  
+  sleep 30
+done
+MONITOR
+
+chmod +x /opt/kong/monitor_health.sh
+echo "[MONITOR] Script de monitoreo creado" | tee -a /var/log/kong-setup.log
+
+# Crear servicio systemd para el monitor
+cat > /etc/systemd/system/kong-monitor.service <<'SERVICE'
+[Unit]
+Description=Kong Backend Health Monitor
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/kong/monitor_health.sh
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable kong-monitor.service
+systemctl start kong-monitor.service
+echo "[MONITOR] Health monitor iniciado" | tee -a /var/log/kong-setup.log
 
 # Crear red Docker para Kong
 docker network create kong-net 2>/dev/null || true
@@ -448,7 +643,7 @@ echo "[DOCKER] Red kong-net creada" | tee -a /var/log/kong-setup.log
 
 # Esperar a que los backends estén listos
 echo "[WAIT] Esperando backends..." | tee -a /var/log/kong-setup.log
-sleep 45
+sleep 60
 
 # Levantar Kong
 docker run -d --name kong \
@@ -471,7 +666,7 @@ docker run -d --name kong \
 echo "[KONG] Contenedor iniciado" | tee -a /var/log/kong-setup.log
 
 # Verificar que Kong esté corriendo
-sleep 10
+sleep 15
 if docker ps | grep -q kong; then
   echo "[SUCCESS] Kong está corriendo" | tee -a /var/log/kong-setup.log
   docker ps | tee -a /var/log/kong-setup.log
@@ -543,6 +738,7 @@ output "instructions" {
 🖥️  Backends directos (solo para pruebas/debugging):
    Backend A: http://${aws_instance.dispatch["a"].public_ip}:8080/despachos/reporte
    Backend B: http://${aws_instance.dispatch["b"].public_ip}:8080/despachos/reporte
+   Backend C: http://${aws_instance.dispatch["c"].public_ip}:8080/despachos/reporte  
 
 💾 Base de datos PostgreSQL:
    IP privada: ${aws_instance.database.private_ip}:5432
@@ -586,6 +782,37 @@ output "instructions" {
    - Los backends deben responder en /despachos/reporte para que el health check funcione
    - Kong balanceará automáticamente las peticiones entre ambos backends
    - Si un backend falla, Kong lo sacará del pool hasta que se recupere
+
+output "sns_topic_arn" {
+  description = "ARN del topic SNS para alertas"
+  value       = aws_sns_topic.backend_alerts.arn
+}
+
+output "alert_instructions" {
+  description = "Instrucciones de configuración de alertas"
+  value       = <<-ALERT
+
+📧 CONFIGURACIÓN DE ALERTAS POR EMAIL
+
+⚠️  IMPORTANTE: Debes confirmar la suscripción de email
+   1. Revisa la bandeja de entrada de: ${var.manager_email}
+   2. Busca un email de AWS Notifications
+   3. Haz clic en "Confirm subscription"
+
+📊 Alertas configuradas:
+   ✅ Sistema degradado (1 de 3 backends activo)
+   🚨 Sistema caído (0 backends activos)
+   ✅ Sistema recuperado (2+ backends activos)
+
+🔍 Monitorear manualmente:
+   curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/health
+
+📝 Ver logs del monitor:
+   ssh ubuntu@${aws_instance.kong.public_ip}
+   tail -f /var/log/kong-monitor.log
+
+ALERT
+}
 
 INSTRUCTIONS
 }
