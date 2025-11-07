@@ -598,7 +598,7 @@ curl -s -X POST "$KONG_ADMIN/upstreams" \
           "http_statuses": [429, 500, 503]
         }
       },
-      "threshold": 34
+      "threshold": 60
     },
     "tags": ["sprint2", "dispatch"]
   }' || echo "Upstream ya existe"
