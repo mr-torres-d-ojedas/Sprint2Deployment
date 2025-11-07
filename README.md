@@ -1,4 +1,5 @@
 # Sprint2Deployment
+
 ## 1. Descripción general
 Este módulo de Terraform despliega la infraestructura del Sprint 2 para la plataforma de despachos en AWS. Crea una base de datos PostgreSQL, dos réplicas del backend Django y una instancia Kong Gateway que actúa como circuit breaker y load balancer, distribuyendo el tráfico HTTP entre los backends con health checks automáticos y recuperación ante fallos.
 
@@ -35,14 +36,18 @@ Para personalizar valores cree un archivo `terraform.tfvars` o exporte variables
 - **Salidas**: IPs privadas/públicas de todos los componentes y URLs de acceso a Kong para consumo inmediato.
 
 ## 5. Pasos de despliegue
+
+### 5.1. Preparación
 ```bash
-terraform init        # Descarga providers y prepara backend local
-terraform fmt         # Normaliza formato (opcional)
-terraform validate    # Verifica sintaxis y dependencias
-terraform plan        # Previsualiza cambios (use -out=planfile si desea aplicar posteriormente)
-terraform apply       # Confirma despliegue; escriba yes cuando se solicite
+cd /path/to/Sprint2Deployment
+
+# Crear archivo de variables (opcional)
+cat > terraform.tfvars <<EOF
+region        = "us-east-1"
+instance_type = "t2.small"
+manager_email = "tu-email@dominio.com"
+EOF
 ```
-Durante `apply`, el `user_data` automatiza la configuración sin intervención manual.
 
 ## 6. Validación posterior
 1. Espere ~3-5 minutos a que Kong y los backends se configuren completamente.
@@ -146,7 +151,83 @@ curl http://localhost:8001/upstreams/backend-cluster/targets | jq
 
 ## 13. Destrucción de la infraestructura
 ```bash
+# Backup manual de PostgreSQL
+ssh ubuntu@<db_public_ip>
+sudo -u postgres pg_dump dispatch_db > /tmp/backup_$(date +%F).sql
+
+# Automatizar backups (cron diario)
+echo "0 2 * * * postgres pg_dump dispatch_db > /backups/dispatch_$(date +\%F).sql" | sudo crontab -
+
+# Backup de configuración de Kong
+curl http://<kong_public_ip>:8001/config > kong_config_$(date +%F).json
+```
+
+### 13.3. Escalado horizontal (agregar backend)
+```bash
+# 1. Crear nueva instancia con Terraform
+# Editar deployment.tf y agregar 'd' al set de backends:
+# for_each = toset(["a", "b", "c", "d"])
+
+# 2. Aplicar cambios
+terraform plan -out=planfile
+terraform apply planfile
+
+# 3. Service discovery detectará automáticamente el nuevo backend en ~30s
+# Verificar:
+curl http://<kong_public_ip>:8001/upstreams/backend-cluster/targets
+```
+
+## 14. Destrucción de infraestructura
+
+### 14.1. Destrucción completa
+```bash
+# Advertencia: Esto elimina TODOS los recursos
 terraform destroy
+
+# Confirmar escribiendo "yes"
+```
+
+### 14.2. Destrucción selectiva
+```bash
+# Eliminar solo backends
+terraform destroy -target=aws_instance.dispatch
+
+# Eliminar solo Kong
+terraform destroy -target=aws_instance.kong
+```
+
+### 14.3. Limpiar state
+```bash
+# Si hay recursos huérfanos
+terraform state list
+terraform state rm aws_instance.orphaned_resource
+```
+
+## 15. Referencias técnicas
+
+### 15.1. Documentación oficial
+- [Terraform AWS Provider](https://registry.terraform.io/providers/hashicorp/aws/latest/docs)
+- [Kong Gateway Documentation](https://docs.konghq.com/gateway/latest/)
+- [PostgreSQL 16 Documentation](https://www.postgresql.org/docs/16/)
+- [Django Deployment Checklist](https://docs.djangoproject.com/en/5.0/howto/deployment/checklist/)
+- [AWS EC2 User Data](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/user-data.html)
+- [Systemd Service Management](https://www.freedesktop.org/software/systemd/man/systemd.service.html)
+
+### 15.2. Plugins de Kong relevantes
+- [Rate Limiting](https://docs.konghq.com/hub/kong-inc/rate-limiting/)
+- [Circuit Breaker](https://docs.konghq.com/hub/kong-inc/circuit-breaker/)
+- [Correlation ID](https://docs.konghq.com/hub/kong-inc/correlation-id/)
+- [Health Checks](https://docs.konghq.com/gateway/latest/how-kong-works/health-checks-circuit-breakers/)
+
+### 15.3. AWS Services utilizados
+- [EC2 Instances](https://aws.amazon.com/ec2/)
+- [VPC Security Groups](https://docs.aws.amazon.com/vpc/latest/userguide/VPC_SecurityGroups.html)
+- [SNS (Simple Notification Service)](https://aws.amazon.com/sns/)
+- [IAM Roles](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles.html)
+
+## 16. Anexos
+
+### 16.1. Diagrama de arquitectura
 ```
 Confirme con `yes`. Esto elimina todas las instancias EC2 y Security Groups asociados.
 

@@ -170,7 +170,49 @@ resource "aws_security_group" "traffic_cb" {
 }
 
 # ------------------------------------------------------------
-# Instancia: Base de datos PostgreSQL
+# Variable para email del manager
+# ------------------------------------------------------------
+variable "manager_email" {
+  description = "Email del manager para recibir alertas"
+  type        = string
+  default     = "dsfafflmao@gmail.com"  # CAMBIAR POR EMAIL REAL
+}
+
+# ------------------------------------------------------------
+# SNS Topic para alertas
+# ------------------------------------------------------------
+resource "aws_sns_topic" "backend_alerts" {
+  name         = "${var.project_prefix}-backend-alerts"
+  display_name = "Backend Health Alerts"
+  
+  tags = merge(local.common_tags, {
+    Name = "${var.project_prefix}-backend-alerts"
+  })
+}
+
+resource "aws_sns_topic_subscription" "manager_email" {
+  topic_arn = aws_sns_topic.backend_alerts.arn
+  protocol  = "email"
+  endpoint  = var.manager_email
+}
+
+
+# ------------------------------------------------------------
+# Usar LabRole existente en lugar de crear uno nuevo
+# ------------------------------------------------------------
+data "aws_iam_role" "lab_role" {
+  name = "LabRole"
+}
+
+data "aws_iam_instance_profile" "lab_profile" {
+  name = "LabInstanceProfile"
+}
+
+
+
+
+# ------------------------------------------------------------
+# Instancia: Base de datos PostgreSQL (compartida: app + kong)
 # ------------------------------------------------------------
 resource "aws_instance" "database" {
   ami                         = data.aws_ami.ubuntu.id
@@ -187,6 +229,10 @@ apt-get install -y postgresql postgresql-contrib
 sudo -u postgres psql -c "CREATE USER dispatch_user WITH PASSWORD 'despacho2025' SUPERUSER;"
 sudo -u postgres createdb -O dispatch_user dispatch_db
 
+# Crear usuario y base de datos para Kong
+sudo -u postgres psql -c "CREATE USER kong WITH PASSWORD 'kong2025';"
+sudo -u postgres createdb -O kong kong
+
 # Configuración de acceso remoto
 echo "host all all 0.0.0.0/0 md5" >> /etc/postgresql/16/main/pg_hba.conf
 echo "listen_addresses='*'" >> /etc/postgresql/16/main/postgresql.conf
@@ -200,11 +246,10 @@ EOT
 }
 
 # ------------------------------------------------------------
-# Instancias: Django Sprint2 (2 réplicas: a y b)
+# Instancias: Django Sprint2 (3 réplicas: a, b y c)
 # ------------------------------------------------------------
 resource "aws_instance" "dispatch" {
-  for_each = toset(["a", "b"])
-
+  for_each = toset(["a", "b", "c"])
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   associate_public_ip_address = true
@@ -253,16 +298,168 @@ echo "[MIGRATE] OK" | tee -a /var/log/backend.log
 /apps/Sprint2/venv/bin/python populateDespachos.py | tee -a /var/log/backend.log || true
 echo "[POPULATE] OK" | tee -a /var/log/backend.log
 
-# Levantar servidor Django
-nohup /apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080 > /var/log/django.log 2>&1 &
-echo "[DJANGO] 8080 OK" | tee -a /var/log/backend.log
+# Crear servicio systemd para Django con auto-recuperación agresiva
+cat > /etc/systemd/system/django-backend.service <<'SERVICE'
+[Unit]
+Description=Django Backend Service (Sprint2) - Auto-Recovery Enabled
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/apps/Sprint2
+Environment="DATABASE_HOST=${aws_instance.database.private_ip}"
+Environment="PATH=/apps/Sprint2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080
+
+# Auto-recuperación: reinicia siempre que falle
+Restart=always
+RestartSec=5
+
+# Reintentos ilimitados (sin límite de reintentos)
+StartLimitInterval=0
+StartLimitBurst=0
+
+# Timeout para inicio del servicio
+TimeoutStartSec=60
+
+# Si el proceso muere por cualquier razón, reiniciar
+# Esto incluye: SIGKILL, SIGTERM, crash por memoria, etc.
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStopSec=30
+
+# Logs
+StandardOutput=append:/var/log/django.log
+StandardError=append:/var/log/django.log
+
+# Prioridad normal
+Nice=0
+
+# Límites de recursos (para evitar consumo excesivo)
+# Memoria máxima: 500MB (ajustar según necesidad)
+MemoryMax=500M
+# Tareas máximas: 100
+TasksMax=100
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# Crear watchdog que monitorea la salud del servicio cada 10 segundos
+cat > /opt/watchdog-django.sh <<'WATCHDOG'
+#!/bin/bash
+# Watchdog para Django - Verifica que el servicio esté respondiendo
+
+LOG="/var/log/django-watchdog.log"
+SERVICE="django-backend.service"
+HEALTH_URL="http://localhost:8080/despachos/reporte"
+MAX_FAILURES=3
+FAILURE_COUNT=0
+
+log() {
+  echo "[$(date +'%%F %%T')] $*" | tee -a "$LOG"
+}
+
+log "🔍 Django Watchdog iniciado"
+
+while true; do
+  # Verificar si el servicio está activo
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    log "⚠️  Servicio $SERVICE no está activo, systemd debería reiniciarlo automáticamente"
+    FAILURE_COUNT=0
+    sleep 10
+    continue
+  fi
+
+  # Verificar si el endpoint responde
+  HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 5 "$HEALTH_URL" 2>/dev/null || echo "000")
+  
+  if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "302" ]; then
+    if [ $FAILURE_COUNT -gt 0 ]; then
+      log "✅ Servicio recuperado (HTTP $HTTP_CODE)"
+    fi
+    FAILURE_COUNT=0
+  else
+    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+    log "❌ Fallo de salud $FAILURE_COUNT/$MAX_FAILURES (HTTP $HTTP_CODE)"
+    
+if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
+  log "🔄 Reiniciando servicio por fallas consecutivas"
+
+  # Reiniciar servicio
+  systemctl restart "$SERVICE"
+  FAILURE_COUNT=0
+
+  # Notificar a SNS (correo)
+  SUBJECT="🚨 Degradación detectada en backend $(hostname)"
+  MESSAGE="El servicio Django en $(hostname) falló $MAX_FAILURES veces consecutivas y fue reiniciado automáticamente."
+  REGION="${var.region}"
+  TOPIC_ARN="${aws_sns_topic.backend_alerts.arn}"
+
+  if command -v aws >/dev/null 2>&1; then
+    aws sns publish --topic-arn "$TOPIC_ARN" \
+      --subject "$SUBJECT" \
+      --message "$MESSAGE" \
+      --region "$REGION" \
+      && log "📨 Notificación de degradación enviada a SNS ($TOPIC_ARN)" \
+      || log "⚠️ Error al enviar notificación SNS"
+  else
+    log "⚠️ AWS CLI no encontrada, no se pudo enviar alerta"
+  fi
+
+  sleep 15
+fi
+  
+  sleep 10
+done
+WATCHDOG
+
+chmod +x /opt/watchdog-django.sh
+
+# Crear servicio systemd para el watchdog
+cat > /etc/systemd/system/django-watchdog.service <<'WATCHSERVICE'
+[Unit]
+Description=Django Health Watchdog
+After=django-backend.service
+Wants=django-backend.service
+
+[Service]
+Type=simple
+ExecStart=/opt/watchdog-django.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+WATCHSERVICE
+
+# Recargar systemd y habilitar servicios
+systemctl daemon-reload
+systemctl enable django-backend.service
+systemctl enable django-watchdog.service
+systemctl start django-backend.service
+systemctl start django-watchdog.service
+
+echo "[SYSTEMD] Django service y watchdog habilitados y ejecutándose" | tee -a /var/log/backend.log
+
+# Verificar que ambos servicios estén corriendo
+sleep 5
+systemctl status django-backend.service --no-pager | tee -a /var/log/backend.log
+systemctl status django-watchdog.service --no-pager | tee -a /var/log/backend.log
 
 # Crear archivo de estado para Kong
 echo "READY" > /tmp/backend_ready
+echo "[COMPLETE] Backend ${each.key} iniciado con auto-recuperación - $(date)" | tee -a /var/log/backend.log
 EOT
 
   depends_on = [aws_instance.database]
-  tags       = merge(local.common_tags, { Name = "${var.project_prefix}-backend-${each.key}" })
+  tags = merge(local.common_tags, {
+    Name = "${var.project_prefix}-backend-${each.key}"
+    Role = "backend"
+  })
 }
 
 # ------------------------------------------------------------
@@ -272,9 +469,11 @@ resource "aws_instance" "kong" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = "t2.small"
   associate_public_ip_address = true
+  iam_instance_profile        = data.aws_iam_instance_profile.lab_profile.name
   vpc_security_group_ids      = [
-    aws_security_group.traffic_cb.id, 
-    aws_security_group.traffic_ssh.id
+    aws_security_group.traffic_cb.id,
+    aws_security_group.traffic_ssh.id,
+    aws_security_group.traffic_db.id
   ]
 
   user_data = <<-EOT
@@ -282,181 +481,74 @@ resource "aws_instance" "kong" {
 set -e
 echo "[INIT] Kong - $(date)" | tee -a /var/log/kong-setup.log
 
-# Instalación de Docker
+# Instalación de dependencias básicas
 apt-get update
-apt-get install -y ca-certificates curl gnupg lsb-release
+DEBIAN_FRONTEND=noninteractive apt-get install -y jq unzip curl ca-certificates gnupg lsb-release postgresql-client
+echo "[DEPS] Dependencias básicas instaladas" | tee -a /var/log/kong-setup.log
 
+# Instalar AWS CLI v2
+cd /tmp
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+unzip -q awscliv2.zip
+./aws/install
+rm -rf aws awscliv2.zip
+/usr/local/bin/aws --version | tee -a /var/log/kong-setup.log
+echo "[AWS-CLI] Instalado OK" | tee -a /var/log/kong-setup.log
+
+# Instalación de Docker
 mkdir -m 0755 -p /etc/apt/keyrings
 curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 
 echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null
 
 apt-get update
-apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+DEBIAN_FRONTEND=noninteractive apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
 
 systemctl enable docker
 systemctl start docker
+docker --version | tee -a /var/log/kong-setup.log
 echo "[DOCKER] Instalado OK" | tee -a /var/log/kong-setup.log
 
 # Crear directorio para configuración de Kong
 mkdir -p /opt/kong/declarative
 cd /opt/kong
 
-# Crear configuración declarativa de Kong
-cat > /opt/kong/declarative/kong.yml <<'KONGCONFIG'
-_format_version: "2.1"
+# Variables de base de datos
+DB_HOST="${aws_instance.database.private_ip}"
 
-# ============================================================
-# UPSTREAMS (Pool de backends con health checks)
-# ============================================================
-upstreams:
-  - name: backend-cluster
-    algorithm: round-robin
-    slots: 10000
-    healthchecks:
-      active:
-        type: http
-        http_path: /despachos/reporte
-        timeout: 5
-        concurrency: 10
-        healthy:
-          interval: 10
-          successes: 2
-          http_statuses:
-            - 200
-            - 302
-        unhealthy:
-          interval: 10
-          http_failures: 3
-          timeouts: 3
-          http_statuses:
-            - 429
-            - 500
-            - 503
-      passive:
-        type: http
-        healthy:
-          successes: 5
-          http_statuses:
-            - 200
-            - 201
-            - 302
-        unhealthy:
-          http_failures: 5
-          timeouts: 2
-          http_statuses:
-            - 429
-            - 500
-            - 503
-    tags:
-      - sprint2
-      - dispatch
-
-# ============================================================
-# TARGETS (Backends específicos)
-# ============================================================
-targets:
-  - target: "${aws_instance.dispatch["a"].private_ip}:8080"
-    upstream: backend-cluster
-    weight: 100
-    tags:
-      - backend-a
-
-  - target: "${aws_instance.dispatch["b"].private_ip}:8080"
-    upstream: backend-cluster
-    weight: 100
-    tags:
-      - backend-b
-
-# ============================================================
-# SERVICES
-# ============================================================
-services:
-  - name: dispatch-service
-    host: backend-cluster
-    port: 8080
-    protocol: http
-    connect_timeout: 60000
-    write_timeout: 60000
-    read_timeout: 60000
-    retries: 5
-    tags:
-      - sprint2
-      - dispatch
-
-    routes:
-      - name: dispatch-report-route
-        paths:
-          - /despachos/reporte
-        strip_path: false
-        preserve_host: false
-        protocols:
-          - http
-        methods:
-          - GET
-          - POST
-          - PUT
-          - DELETE
-          - PATCH
-          - OPTIONS
-        tags:
-          - main-route
-
-      - name: dispatch-root-route
-        paths:
-          - /
-        strip_path: false
-        preserve_host: false
-        protocols:
-          - http
-        methods:
-          - GET
-        tags:
-          - root-route
-
-# ============================================================
-# PLUGINS GLOBALES
-# ============================================================
-plugins:
-  - name: rate-limiting
-    enabled: true
-    config:
-      minute: 100
-      policy: local
-      fault_tolerant: true
-      hide_client_headers: false
-    tags:
-      - rate-limiting
-      - protection
-
-  - name: correlation-id
-    enabled: true
-    config:
-      header_name: X-Kong-Request-ID
-      generator: uuid
-      echo_downstream: true
-    tags:
-      - observability
-KONGCONFIG
-
-
-echo "[CONFIG] Kong YML creado" | tee -a /var/log/kong-setup.log
+# Esperar a que PostgreSQL esté listo
+echo "[WAIT] Esperando PostgreSQL..." | tee -a /var/log/kong-setup.log
+until PGPASSWORD=kong2025 psql -h "$DB_HOST" -U kong -d kong -c '\q' 2>/dev/null; do
+  echo "Esperando PostgreSQL en $DB_HOST..." | tee -a /var/log/kong-setup.log
+  sleep 5
+done
+echo "[DB] PostgreSQL listo" | tee -a /var/log/kong-setup.log
 
 # Crear red Docker para Kong
 docker network create kong-net 2>/dev/null || true
 echo "[DOCKER] Red kong-net creada" | tee -a /var/log/kong-setup.log
 
-# Esperar a que los backends estén listos
-echo "[WAIT] Esperando backends..." | tee -a /var/log/kong-setup.log
-sleep 45
+# Ejecutar migraciones de Kong
+echo "[KONG] Ejecutando migraciones..." | tee -a /var/log/kong-setup.log
+docker run --rm --network=kong-net \
+  -e "KONG_DATABASE=postgres" \
+  -e "KONG_PG_HOST=$DB_HOST" \
+  -e "KONG_PG_USER=kong" \
+  -e "KONG_PG_PASSWORD=kong2025" \
+  -e "KONG_PG_DATABASE=kong" \
+  kong/kong-gateway:2.7.2.0-alpine kong migrations bootstrap
 
-# Levantar Kong
+echo "[KONG] Migraciones completadas" | tee -a /var/log/kong-setup.log
+
+# Levantar Kong con base de datos
 docker run -d --name kong \
   --network=kong-net \
   --restart=unless-stopped \
-  -v /opt/kong/declarative:/kong/declarative/ \
-  -e "KONG_DATABASE=off" \
-  -e "KONG_DECLARATIVE_CONFIG=/kong/declarative/kong.yml" \
+  -e "KONG_DATABASE=postgres" \
+  -e "KONG_PG_HOST=$DB_HOST" \
+  -e "KONG_PG_USER=kong" \
+  -e "KONG_PG_PASSWORD=kong2025" \
+  -e "KONG_PG_DATABASE=kong" \
   -e "KONG_PROXY_ACCESS_LOG=/dev/stdout" \
   -e "KONG_ADMIN_ACCESS_LOG=/dev/stdout" \
   -e "KONG_PROXY_ERROR_LOG=/dev/stderr" \
@@ -468,17 +560,419 @@ docker run -d --name kong \
   -p 8002:8002 \
   kong/kong-gateway:2.7.2.0-alpine
 
-echo "[KONG] Contenedor iniciado" | tee -a /var/log/kong-setup.log
+echo "[KONG] Contenedor iniciado con PostgreSQL" | tee -a /var/log/kong-setup.log
 
-# Verificar que Kong esté corriendo
-sleep 10
-if docker ps | grep -q kong; then
-  echo "[SUCCESS] Kong está corriendo" | tee -a /var/log/kong-setup.log
-  docker ps | tee -a /var/log/kong-setup.log
-else
-  echo "[ERROR] Kong no está corriendo" | tee -a /var/log/kong-setup.log
-  docker logs kong | tee -a /var/log/kong-setup.log
-fi
+# Esperar a que Kong esté listo
+echo "[WAIT] Esperando Kong Admin API..." | tee -a /var/log/kong-setup.log
+for i in {1..60}; do
+  if curl -sf http://localhost:8001/ >/dev/null 2>&1; then
+    echo "[KONG] Admin API disponible" | tee -a /var/log/kong-setup.log
+    break
+  fi
+  sleep 5
+done
+
+# Configurar Kong usando declarative config inicial
+cat > /opt/kong/init-kong.sh <<'INIT'
+#!/bin/bash
+set -e
+KONG_ADMIN="http://localhost:8001"
+
+echo "[INIT] Configurando Kong vía Admin API..."
+
+# Crear upstream
+curl -s -X POST "$KONG_ADMIN/upstreams" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "backend-cluster",
+    "algorithm": "round-robin",
+    "slots": 10000,
+    "healthchecks": {
+      "active": {
+        "type": "http",
+        "http_path": "/despachos/reporte",
+        "timeout": 5,
+        "concurrency": 10,
+        "healthy": {
+          "interval": 10,
+          "successes": 2,
+          "http_statuses": [200, 302]
+        },
+        "unhealthy": {
+          "interval": 10,
+          "http_failures": 3,
+          "timeouts": 3,
+          "http_statuses": [429, 500, 503]
+        }
+      },
+      "passive": {
+        "type": "http",
+        "healthy": {
+          "successes": 5,
+          "http_statuses": [200, 201, 302]
+        },
+        "unhealthy": {
+          "http_failures": 5,
+          "timeouts": 2,
+          "http_statuses": [429, 500, 503]
+        }
+      },
+      "threshold": 60
+    },
+    "tags": ["sprint2", "dispatch"]
+  }' || echo "Upstream ya existe"
+
+# Crear servicio
+curl -s -X POST "$KONG_ADMIN/services" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "dispatch-service",
+    "host": "backend-cluster",
+    "port": 8080,
+    "protocol": "http",
+    "connect_timeout": 60000,
+    "write_timeout": 60000,
+    "read_timeout": 60000,
+    "retries": 5,
+    "tags": ["sprint2", "dispatch"]
+  }' || echo "Servicio ya existe"
+
+# Crear ruta principal
+curl -s -X POST "$KONG_ADMIN/services/dispatch-service/routes" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "dispatch-report-route",
+    "paths": ["/despachos/reporte"],
+    "strip_path": false,
+    "preserve_host": false,
+    "protocols": ["http"],
+    "methods": ["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"],
+    "tags": ["main-route"]
+  }' || echo "Ruta principal ya existe"
+
+# Crear ruta raíz
+curl -s -X POST "$KONG_ADMIN/services/dispatch-service/routes" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "dispatch-root-route",
+    "paths": ["/"],
+    "strip_path": false,
+    "preserve_host": false,
+    "protocols": ["http"],
+    "methods": ["GET"],
+    "tags": ["root-route"]
+  }' || echo "Ruta raíz ya existe"
+
+# Plugin: Rate Limiting
+curl -s -X POST "$KONG_ADMIN/plugins" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "rate-limiting",
+    "enabled": true,
+    "config": {
+      "minute": 100,
+      "policy": "local",
+      "fault_tolerant": true,
+      "hide_client_headers": false
+    },
+    "tags": ["rate-limiting", "protection"]
+  }' || echo "Rate limiting ya existe"
+
+# Plugin: Correlation ID
+curl -s -X POST "$KONG_ADMIN/plugins" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "correlation-id",
+    "enabled": true,
+    "config": {
+      "header_name": "X-Kong-Request-ID",
+      "generator": "uuid",
+      "echo_downstream": true
+    },
+    "tags": ["observability"]
+  }' || echo "Correlation ID ya existe"
+
+echo "[INIT] Kong configurado exitosamente"
+INIT
+
+chmod +x /opt/kong/init-kong.sh
+/opt/kong/init-kong.sh | tee -a /var/log/kong-setup.log
+
+# -------------------------------------------
+# Service Discovery: sincroniza targets en Kong dinámicamente
+# -------------------------------------------
+cat > /opt/kong/discover_backends.sh <<'DISCOVERY'
+#!/usr/bin/env bash
+set -euo pipefail
+
+KONG_ADMIN="http://localhost:8001"
+UPSTREAM="backend-cluster"
+REGION="${var.region}"
+PROJECT_TAG="${local.project_name}"
+ROLE_TAG="backend"
+PORT="8080"
+LOG="/var/log/kong-discovery.log"
+
+log() { 
+  echo "[$(date +'%F %T')] $*"
+  echo "[$(date +'%F %T')] $*" >> "$LOG"
+}
+
+wait_kong() {
+  for i in {1..60}; do
+    if curl -sf "$KONG_ADMIN/" >/dev/null 2>&1; then 
+      log "Kong Admin API disponible"
+      return 0
+    fi
+    sleep 5
+  done
+  log "ERROR: Kong Admin API no disponible"
+  return 1
+}
+
+sync() {
+  log "=== Iniciando sincronización ==="
+  
+  # Obtener IPs privadas de instancias EC2 con tags y estado RUNNING
+  mapfile -t discovered_ips < <(/usr/local/bin/aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters "Name=tag:Project,Values=$PROJECT_TAG" \
+              "Name=tag:Role,Values=$ROLE_TAG" \
+              "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].PrivateIpAddress' \
+    --output text 2>/dev/null | tr '\t' '\n' | grep -v '^$' | sort -u)
+
+  desired=()
+  for ip in "$${discovered_ips[@]}"; do
+    [[ -n "$ip" ]] && desired+=("$ip:$PORT")
+  done
+
+  log "Backends descubiertos vía EC2: $${#desired[@]}"
+  for t in "$${desired[@]}"; do
+    log "  - $t"
+  done
+
+  # Obtener targets actuales de Kong (weight > 0 = activos)
+  mapfile -t current < <(curl -sf "$KONG_ADMIN/upstreams/$UPSTREAM/targets" 2>/dev/null \
+    | jq -r '.data[]? | select(.weight > 0) | .target' 2>/dev/null \
+    | sort -u || true)
+
+  log "Targets activos en Kong: $${#current[@]}"
+  for t in "$${current[@]}"; do
+    log "  - $t"
+  done
+
+  # Agregar targets faltantes
+  for target in "$${desired[@]}"; do
+    if ! printf '%s\n' "$${current[@]}" | grep -qFx "$target" 2>/dev/null; then
+      log "🔵 AGREGANDO target: $target"
+      response=$(curl -sf -X POST "$KONG_ADMIN/upstreams/$UPSTREAM/targets" \
+        -H "Content-Type: application/json" \
+        -d "{\"target\":\"$target\",\"weight\":100}" 2>&1)
+      
+      if [ $? -eq 0 ]; then
+        log "✅ Target $target agregado exitosamente"
+      else
+        log "⚠️  Error al agregar $target: $response"
+      fi
+    fi
+  done
+
+  # Eliminar targets obsoletos (backends que ya no existen)
+  for target in "$${current[@]}"; do
+    if ! printf '%s\n' "$${desired[@]}" | grep -qFx "$target" 2>/dev/null; then
+      log "🔴 ELIMINANDO target obsoleto: $target"
+      
+      # Obtener el ID del target
+      target_id=$(curl -sf "$KONG_ADMIN/upstreams/$UPSTREAM/targets" \
+        | jq -r ".data[]? | select(.target==\"$target\") | .id" 2>/dev/null | head -n1)
+      
+      if [ -n "$target_id" ]; then
+        response=$(curl -sf -X DELETE "$KONG_ADMIN/upstreams/$UPSTREAM/targets/$target_id" 2>&1)
+        if [ $? -eq 0 ]; then
+          log "✅ Target $target eliminado exitosamente"
+        else
+          log "⚠️  Error al eliminar $target: $response"
+        fi
+      else
+        log "⚠️  No se encontró ID para target $target"
+      fi
+    fi
+  done
+
+  log "=== Sincronización completada. Desired: $${#desired[@]}, Current: $${#current[@]} ==="
+}
+
+log "🚀 Iniciando Kong Service Discovery"
+log "   Project: $PROJECT_TAG"
+log "   Role: $ROLE_TAG"
+log "   Region: $REGION"
+
+wait_kong || { log "❌ Kong Admin no disponible"; exit 1; }
+
+# Loop infinito de sincronización cada 30 segundos
+while true; do
+  sync || log "⚠️  Error en ciclo de sincronización"
+  sleep 30
+done
+DISCOVERY
+
+chmod +x /opt/kong/discover_backends.sh
+echo "[DISCOVERY] Script creado" | tee -a /var/log/kong-setup.log
+
+# Servicio systemd para discovery
+cat > /etc/systemd/system/kong-discovery.service <<'SERVICE'
+[Unit]
+Description=Kong Upstream Discovery
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/kong/discover_backends.sh
+Restart=always
+RestartSec=5
+StandardOutput=append:/var/log/kong-discovery.log
+StandardError=append:/var/log/kong-discovery.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable kong-discovery.service
+systemctl start kong-discovery.service
+echo "[DISCOVERY] Servicio de discovery iniciado" | tee -a /var/log/kong-setup.log
+
+systemctl daemon-reload
+systemctl enable kong-discovery.service
+systemctl start kong-discovery.service
+echo "[DISCOVERY] Servicio de discovery iniciado" | tee -a /var/log/kong-setup.log
+
+# --- NUEVO: Monitor de salud con alertas SNS ---
+cat > /opt/kong/monitor_health.sh <<'MONITOR'
+#!/bin/bash
+# Monitor de health de backends y alertas SNS
+
+KONG_ADMIN="http://localhost:8001"
+SNS_TOPIC_ARN="${aws_sns_topic.backend_alerts.arn}"
+ALERT_SENT_FILE="/tmp/degradation_alert_sent"
+REGION="${var.region}"
+
+# IP pública de la instancia (para contexto en el correo)
+KONG_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a /var/log/kong-monitor.log; }
+
+while true; do
+  HEALTH_JSON=$(curl -s "$KONG_ADMIN/upstreams/backend-cluster/health" || echo '')
+  if [ -z "$HEALTH_JSON" ]; then
+    log "No se pudo obtener health de Kong"
+    sleep 30
+    continue
+  fi
+
+  TOTAL=$(echo "$HEALTH_JSON" | jq -r '.data | length' 2>/dev/null)
+  HEALTHY=$(echo "$HEALTH_JSON" | jq -r '[.data[] | select(.health == "HEALTHY")] | length' 2>/dev/null)
+
+  # Fallback si formato difiere o jq falla
+  if [ -z "$TOTAL" ] || [ "$TOTAL" = "null" ]; then TOTAL=0; fi
+  if [ -z "$HEALTHY" ] || [ "$HEALTHY" = "null" ]; then HEALTHY=0; fi
+
+  log "Backends: $HEALTHY/$TOTAL saludables"
+
+  if [ "$TOTAL" -eq 3 ] && [ "$HEALTHY" -eq 1 ]; then
+    log "[DEGRADED] Solo 1 backend activo de 3"
+    if [ ! -f "$ALERT_SENT_FILE" ]; then
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "⚠️ ALERTA: Sistema en Modo Degradado" \
+        --message "ALERTA: Solo 1 de 3 backends está operativo.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+Se recomienda revisar los backends caídos.
+
+Backends:
+- Backend A: ${aws_instance.dispatch["a"].private_ip}
+- Backend B: ${aws_instance.dispatch["b"].private_ip}
+- Backend C: ${aws_instance.dispatch["c"].private_ip}
+
+Ver estado:
+curl http://$KONG_PUBLIC_IP:8001/upstreams/backend-cluster/health" \
+        --region "$REGION" && touch "$ALERT_SENT_FILE"
+      log "[ALERT] Notificación de degradación enviada"
+    fi
+
+  elif [ "$HEALTHY" -eq 0 ] && [ "$TOTAL" -gt 0 ]; then
+    log "[CRITICAL] Todos los backends caídos"
+    /usr/local/bin/aws sns publish \
+      --topic-arn "$SNS_TOPIC_ARN" \
+      --subject "🚨 CRÍTICO: Sistema Completamente Caído" \
+      --message "ALERTA: 0 de $TOTAL backends operativos.
+
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+Acciones recomendadas:
+1. Verificar logs de backends
+2. Reiniciar servicios Django
+3. Verificar conectividad" \
+      --region "$REGION"
+
+  else
+    if [ -f "$ALERT_SENT_FILE" ]; then
+      rm -f "$ALERT_SENT_FILE"
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "✅ RECUPERACIÓN: Sistema Operativo Normal" \
+        --message "El sistema volvió a la normalidad.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP" \
+        --region "$REGION"
+      log "[RECOVERY] Notificación de recuperación enviada"
+    fi
+  fi
+
+  sleep 30
+done
+MONITOR
+
+chmod +x /opt/kong/monitor_health.sh
+echo "[MONITOR] Script de monitoreo creado" | tee -a /var/log/kong-setup.log
+
+cat > /etc/systemd/system/kong-monitor.service <<'SERVICE'
+[Unit]
+Description=Kong Backend Health Monitor (SNS Alerts)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/kong/monitor_health.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/kong-monitor.log
+StandardError=append:/var/log/kong-monitor.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable kong-monitor.service
+systemctl start kong-monitor.service
+echo "[MONITOR] Health monitor iniciado" | tee -a /var/log/kong-setup.log
+# --- FIN Monitor SNS ---
+
+# Crear archivo de estado
+echo "READY" > /tmp/kong_ready
+echo "[COMPLETE] Setup finalizado - $(date)" | tee -a /var/log/kong-setup.log
 
 # Crear archivo de estado
 echo "READY" > /tmp/kong_ready
@@ -499,6 +993,7 @@ EOT
 # ------------------------------------------------------------
 # Salidas
 # ------------------------------------------------------------
+
 output "kong_public_ip" {
   description = "Public IP address for the Kong circuit breaker instance"
   value       = aws_instance.kong.public_ip
@@ -540,52 +1035,130 @@ output "instructions" {
    🏠 URL Raíz (redirige): http://${aws_instance.kong.public_ip}:8000/
    🔧 Admin API: http://${aws_instance.kong.public_ip}:8001
 
-🖥️  Backends directos (solo para pruebas/debugging):
-   Backend A: http://${aws_instance.dispatch["a"].public_ip}:8080/despachos/reporte
-   Backend B: http://${aws_instance.dispatch["b"].public_ip}:8080/despachos/reporte
+🔍 SERVICE DISCOVERY ACTIVO:
+   ✅ Kong sincroniza automáticamente los backends cada 30 segundos
+   ✅ Agrega nuevas instancias que se levanten con tags correctos
+   ✅ Elimina instancias que se apaguen o terminen
+   ✅ Usa IPs privadas (no afecta cambio de IP pública)
+
+🛡️  AUTO-RECUPERACIÓN DE BACKENDS:
+   ✅ Systemd reinicia automáticamente si Django se cae (cada 5 segundos)
+   ✅ Watchdog monitorea salud del endpoint cada 10 segundos
+   ✅ Si 3 health checks fallan consecutivas, fuerza restart
+   ✅ Protección contra DDOS: límite de memoria (500MB) y tareas (100)
+   ✅ Reintentos ilimitados (no se rinde nunca)
+
+🖥️  Backends descubiertos automáticamente:
+   Backend A: ${aws_instance.dispatch["a"].private_ip}:8080
+   Backend B: ${aws_instance.dispatch["b"].private_ip}:8080
+   Backend C: ${aws_instance.dispatch["c"].private_ip}:8080
 
 💾 Base de datos PostgreSQL:
    IP privada: ${aws_instance.database.private_ip}:5432
-   Usuario: dispatch_user
-   Base de datos: dispatch_db
+   App DB: dispatch_db (usuario: dispatch_user)
+   Kong DB: kong (usuario: kong)
 
 📊 KONG Configuration:
-   ✅ Balanceo de carga entre 2 backends (Round Robin)
+   ✅ Modo con base de datos PostgreSQL (permite cambios dinámicos)
+   ✅ Service Discovery automático vía AWS API
    ✅ Health checks activos en /despachos/reporte cada 10 segundos
    ⚡ Rate limiting: 100 peticiones/minuto
    🛡️  Circuit breaker: 3 fallos → circuit abierto
    🔄 Auto-recuperación de backends fallidos
 
-🔍 COMANDOS ÚTILES (verificación):
-   # Probar acceso vía Kong
-   curl http://${aws_instance.kong.public_ip}:8000/despachos/reporte
-   
-   # Ver estado de backends
+🔍 COMANDOS ÚTILES:
+   # Ver backends descubiertos y su estado
    curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/health
    
-   # Ver servicios configurados
-   curl http://${aws_instance.kong.public_ip}:8001/services
-   
-   # Ver rutas configuradas
-   curl http://${aws_instance.kong.public_ip}:8001/routes
-   
-   # Ver targets y su estado
+   # Ver targets configurados
    curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/targets
-
-🐛 DEBUG (si algo falla):
-   # Ver logs de Kong
-   ssh -i tu-key.pem ubuntu@${aws_instance.kong.public_ip}
-   tail -f /var/log/kong.log
-   tail -f /usr/local/kong/logs/error.log
    
-   # Verificar estado de Kong
-   kong health
+   # Ver logs del discovery
+   ssh ubuntu@${aws_instance.kong.public_ip}
+   tail -f /var/log/kong-discovery.log
+   
+   # Verificar servicio de discovery
+   systemctl status kong-discovery
 
-📝 NOTAS:
+🔧 MONITOREAR AUTO-RECUPERACIÓN (en cada backend):
+   # Ver estado del servicio Django
+   systemctl status django-backend.service
+   
+   # Ver logs de Django
+   tail -f /var/log/django.log
+   
+   # Ver logs del watchdog
+   tail -f /var/log/django-watchdog.log
+   
+   # Ver cantidad de reinicios
+   systemctl show django-backend.service | grep NRestarts
+   
+   # Forzar reinicio manual (para pruebas)
+   systemctl restart django-backend.service
+
+🧪 PROBAR AUTO-RECUPERACIÓN:
+   1. Simular caída de Django:
+      ssh ubuntu@<backend-ip>
+      sudo systemctl kill -s SIGKILL django-backend.service
+      
+   2. Observar logs:
+      tail -f /var/log/django.log
+      tail -f /var/log/django-watchdog.log
+      
+   3. El servicio debe reiniciarse en ~5 segundos
+   4. Kong detectará el reinicio en el siguiente health check (~10s)
+   
+   5. Simular DDOS (saturar el backend):
+      ab -n 10000 -c 100 http://<backend-ip>:8080/despachos/reporte
+      
+   6. Si Django se cae, debe reiniciarse automáticamente
+
+🧪 PROBAR DISCOVERY:
+   1. Detén un backend: aws ec2 stop-instances --instance-ids <id>
+   2. Espera 30-60 segundos (ciclo de discovery + health check)
+   3. Verifica: curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/targets
+   4. El backend detenido debe desaparecer automáticamente
+   5. Reinicia el backend y debe reaparecer en ~30-60 segundos
+
+📝 NOTAS DE DISPONIBILIDAD:
    - Kong tarda ~3-5 minutos en estar completamente operativo
-   - Los backends deben responder en /despachos/reporte para que el health check funcione
-   - Kong balanceará automáticamente las peticiones entre ambos backends
-   - Si un backend falla, Kong lo sacará del pool hasta que se recupere
+   - El discovery se ejecuta cada 30 segundos
+   - Watchdog verifica salud cada 10 segundos
+   - Systemd reinicia Django en 5 segundos si se cae
+   - Límite de memoria: 500MB por backend (ajustar si es necesario)
+   - Límite de tareas: 100 concurrentes por backend
+   - Los backends NUNCA dejan de intentar reiniciarse (StartLimitBurst=0)
 
 INSTRUCTIONS
+}
+
+output "sns_topic_arn" {
+  description = "ARN del topic SNS para alertas"
+  value       = aws_sns_topic.backend_alerts.arn
+}
+
+output "alert_instructions" {
+  description = "Instrucciones de configuración de alertas"
+  value       = <<-ALERT
+
+📧 CONFIGURACIÓN DE ALERTAS POR EMAIL
+
+⚠️  IMPORTANTE: Debes confirmar la suscripción de email
+   1. Revisa la bandeja de entrada de: ${var.manager_email}
+   2. Busca un email de AWS Notifications
+   3. Haz clic en "Confirm subscription"
+
+📊 Alertas configuradas:
+   ✅ Sistema degradado (1 de 3 backends activo)
+   🚨 Sistema caído (0 backends activos)
+   ✅ Sistema recuperado (2+ backends activos)
+
+🔍 Monitorear manualmente:
+   curl http://${aws_instance.kong.public_ip}:8001/upstreams/backend-cluster/health
+
+📝 Ver logs del monitor:
+   ssh ubuntu@${aws_instance.kong.public_ip}
+   tail -f /var/log/kong-monitor.log
+
+ALERT
 }
