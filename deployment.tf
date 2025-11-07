@@ -242,11 +242,10 @@ EOT
 }
 
 # ------------------------------------------------------------
-# Instancias: Django Sprint2 (2 réplicas: a, b y c)
+# Instancias: Django Sprint2 (3 réplicas: a, b y c)
 # ------------------------------------------------------------
 resource "aws_instance" "dispatch" {
   for_each = toset(["a", "b", "c"])
-
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = var.instance_type
   associate_public_ip_address = true
@@ -295,16 +294,53 @@ echo "[MIGRATE] OK" | tee -a /var/log/backend.log
 /apps/Sprint2/venv/bin/python populateDespachos.py | tee -a /var/log/backend.log || true
 echo "[POPULATE] OK" | tee -a /var/log/backend.log
 
-# Levantar servidor Django
-nohup /apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080 > /var/log/django.log 2>&1 &
-echo "[DJANGO] 8080 OK" | tee -a /var/log/backend.log
+# Crear servicio systemd para Django
+cat > /etc/systemd/system/django-backend.service <<'SERVICE'
+[Unit]
+Description=Django Backend Service (Sprint2)
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/apps/Sprint2
+Environment="DATABASE_HOST=${aws_instance.database.private_ip}"
+Environment="PATH=/apps/Sprint2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/django.log
+StandardError=append:/var/log/django.log
+
+# Configuración de reintentos
+StartLimitInterval=0
+StartLimitBurst=0
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+# Recargar systemd y habilitar el servicio
+systemctl daemon-reload
+systemctl enable django-backend.service
+systemctl start django-backend.service
+echo "[SYSTEMD] Django service habilitado y ejecutándose" | tee -a /var/log/backend.log
+
+# Verificar que el servicio esté corriendo
+sleep 5
+systemctl status django-backend.service --no-pager | tee -a /var/log/backend.log
 
 # Crear archivo de estado para Kong
 echo "READY" > /tmp/backend_ready
+echo "[COMPLETE] Backend ${each.key} iniciado - $(date)" | tee -a /var/log/backend.log
 EOT
 
   depends_on = [aws_instance.database]
-  tags       = merge(local.common_tags, { Name = "${var.project_prefix}-backend-${each.key}" })
+  tags = merge(local.common_tags, {
+    Name = "${var.project_prefix}-backend-${each.key}"
+    Role = "backend"                       # <- Tag para discovery
+  })
 }
 
 # ------------------------------------------------------------
@@ -316,7 +352,7 @@ resource "aws_instance" "kong" {
   associate_public_ip_address = true
   iam_instance_profile        = data.aws_iam_instance_profile.lab_profile.name
   vpc_security_group_ids      = [
-    aws_security_group.traffic_cb.id, 
+    aws_security_group.traffic_cb.id,
     aws_security_group.traffic_ssh.id
   ]
 
@@ -403,7 +439,7 @@ upstreams:
             - 429
             - 500
             - 503
-      threshold: 33
+      threshold: 35
     tags:
       - sprint2
       - dispatch
@@ -612,6 +648,107 @@ Todos los backends están operativos nuevamente." \
 done
 MONITOR
 
+
+# -------------------------------------------
+# Service Discovery: sincroniza targets en Kong
+# -------------------------------------------
+cat > /opt/kong/discover_backends.sh <<DISCOVERY
+#!/usr/bin/env bash
+set -euo pipefail
+
+KONG_ADMIN="http://localhost:8001"
+UPSTREAM="backend-cluster"
+REGION="${var.region}"
+PROJECT_TAG="${local.project_name}"
+ROLE_TAG="backend"
+PORT="8080"
+LOG="/var/log/kong-discovery.log"
+
+log() { echo "[$(date +'%F %T')] $*"; echo "[$(date +'%F %T')] $*" >> "$LOG"; }
+
+wait_kong() {
+  for i in {1..60}; do
+    if curl -sf "$KONG_ADMIN/" >/dev/null; then return 0; fi
+    sleep 5
+  done
+  return 1
+}
+
+sync() {
+  # Deseados: IPs privadas de instancias con tags y RUNNING
+  mapfile -t ips < <(/usr/local/bin/aws ec2 describe-instances \
+    --region "$REGION" \
+    --filters "Name=tag:Project,Values=$PROJECT_TAG" \
+              "Name=tag:Role,Values=$ROLE_TAG" \
+              "Name=instance-state-name,Values=running" \
+    --query 'Reservations[].Instances[].PrivateIpAddress' \
+    --output text 2>/dev/null | tr '\t' '\n' | sort -u)
+
+  desired=()
+  for ip in "$${ips[@]}"; do
+    [[ -n "$ip" ]] && desired+=("$ip:$PORT")
+  done
+
+  # Actuales en Kong (solo activos weight>0)
+  mapfile -t current < <(curl -sf "$KONG_ADMIN/upstreams/$UPSTREAM/targets" \
+    | jq -r '.data[] | select(.weight>0) | .target' | sort -u || true)
+
+  # Add missing
+  for t in "$${desired[@]}"; do
+    if ! printf '%s\n' "$${current[@]}" | grep -qx "$t"; then
+      log "ADD target $t"
+      curl -sS -X POST "$KONG_ADMIN/upstreams/$UPSTREAM/targets" \
+        -H "Content-Type: application/json" \
+        -d "{\"target\":\"$t\",\"weight\":100}" >/dev/null || log "WARN add failed $t"
+    fi
+  done
+
+  # Remove stale
+  for c in "$${current[@]}"; do
+    if ! printf '%s\n' "$${desired[@]}" | grep -qx "$c"; then
+      log "DEL target $c"
+      curl -sS -X DELETE "$KONG_ADMIN/upstreams/$UPSTREAM/targets/$c" >/dev/null || log "WARN delete failed $c"
+    fi
+  done
+
+  log "Sync done. desired=$${#desired[@]} current=$${#current[@]}"
+}
+
+log "Starting discovery loop. project=$PROJECT_TAG role=$ROLE_TAG"
+wait_kong || { log "Kong Admin no disponible"; exit 1; }
+
+while true; do
+  sync
+  sleep 30
+done
+DISCOVERY
+
+chmod +x /opt/kong/discover_backends.sh
+echo "[DISCOVERY] Script creado" | tee -a /var/log/kong-setup.log
+
+# Servicio systemd para discovery
+cat > /etc/systemd/system/kong-discovery.service <<'SERVICE'
+[Unit]
+Description=Kong Upstream Discovery
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/kong/discover_backends.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable kong-discovery.service
+systemctl start kong-discovery.service
+echo "[DISCOVERY] Servicio iniciado" | tee -a /var/log/kong-setup.log
+
 chmod +x /opt/kong/monitor_health.sh
 echo "[MONITOR] Script de monitoreo creado" | tee -a /var/log/kong-setup.log
 
@@ -694,6 +831,7 @@ EOT
 # ------------------------------------------------------------
 # Salidas
 # ------------------------------------------------------------
+
 output "kong_public_ip" {
   description = "Public IP address for the Kong circuit breaker instance"
   value       = aws_instance.kong.public_ip
@@ -723,6 +861,12 @@ output "backend_public_ips" {
   description = "IPs públicas de las instancias backend (acceso directo)"
   value       = { for k, v in aws_instance.dispatch : k => v.public_ip }
 }
+
+output "sns_topic_arn" {
+  description = "ARN del topic SNS para alertas"
+  value       = aws_sns_topic.backend_alerts.arn
+}
+
 
 output "instructions" {
   description = "Instrucciones de uso"
