@@ -386,13 +386,32 @@ while true; do
     FAILURE_COUNT=$((FAILURE_COUNT + 1))
     log "❌ Fallo de salud $FAILURE_COUNT/$MAX_FAILURES (HTTP $HTTP_CODE)"
     
-    if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
-      log "🔄 Reiniciando servicio por fallas consecutivas"
-      systemctl restart "$SERVICE"
-      FAILURE_COUNT=0
-      sleep 15
-    fi
+if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
+  log "🔄 Reiniciando servicio por fallas consecutivas"
+
+  # Reiniciar servicio
+  systemctl restart "$SERVICE"
+  FAILURE_COUNT=0
+
+  # Notificar a SNS (correo)
+  SUBJECT="🚨 Degradación detectada en backend $(hostname)"
+  MESSAGE="El servicio Django en $(hostname) falló $MAX_FAILURES veces consecutivas y fue reiniciado automáticamente."
+  REGION="${var.region}"
+  TOPIC_ARN="${aws_sns_topic.backend_alerts.arn}"
+
+  if command -v aws >/dev/null 2>&1; then
+    aws sns publish --topic-arn "$TOPIC_ARN" \
+      --subject "$SUBJECT" \
+      --message "$MESSAGE" \
+      --region "$REGION" \
+      && log "📨 Notificación de degradación enviada a SNS ($TOPIC_ARN)" \
+      || log "⚠️ Error al enviar notificación SNS"
+  else
+    log "⚠️ AWS CLI no encontrada, no se pudo enviar alerta"
   fi
+
+  sleep 15
+fi
   
   sleep 10
 done
@@ -825,6 +844,135 @@ systemctl daemon-reload
 systemctl enable kong-discovery.service
 systemctl start kong-discovery.service
 echo "[DISCOVERY] Servicio de discovery iniciado" | tee -a /var/log/kong-setup.log
+
+systemctl daemon-reload
+systemctl enable kong-discovery.service
+systemctl start kong-discovery.service
+echo "[DISCOVERY] Servicio de discovery iniciado" | tee -a /var/log/kong-setup.log
+
+# --- NUEVO: Monitor de salud con alertas SNS ---
+cat > /opt/kong/monitor_health.sh <<'MONITOR'
+#!/bin/bash
+# Monitor de health de backends y alertas SNS
+
+KONG_ADMIN="http://localhost:8001"
+SNS_TOPIC_ARN="${aws_sns_topic.backend_alerts.arn}"
+ALERT_SENT_FILE="/tmp/degradation_alert_sent"
+REGION="${var.region}"
+
+# IP pública de la instancia (para contexto en el correo)
+KONG_PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+log() { echo "[$(date '+%F %T')] $*" | tee -a /var/log/kong-monitor.log; }
+
+while true; do
+  HEALTH_JSON=$(curl -s "$KONG_ADMIN/upstreams/backend-cluster/health" || echo '')
+  if [ -z "$HEALTH_JSON" ]; then
+    log "No se pudo obtener health de Kong"
+    sleep 30
+    continue
+  fi
+
+  TOTAL=$(echo "$HEALTH_JSON" | jq -r '.data | length' 2>/dev/null)
+  HEALTHY=$(echo "$HEALTH_JSON" | jq -r '[.data[] | select(.health == "HEALTHY")] | length' 2>/dev/null)
+
+  # Fallback si formato difiere o jq falla
+  if [ -z "$TOTAL" ] || [ "$TOTAL" = "null" ]; then TOTAL=0; fi
+  if [ -z "$HEALTHY" ] || [ "$HEALTHY" = "null" ]; then HEALTHY=0; fi
+
+  log "Backends: $HEALTHY/$TOTAL saludables"
+
+  if [ "$TOTAL" -eq 3 ] && [ "$HEALTHY" -eq 1 ]; then
+    log "[DEGRADED] Solo 1 backend activo de 3"
+    if [ ! -f "$ALERT_SENT_FILE" ]; then
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "⚠️ ALERTA: Sistema en Modo Degradado" \
+        --message "ALERTA: Solo 1 de 3 backends está operativo.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+Se recomienda revisar los backends caídos.
+
+Backends:
+- Backend A: ${aws_instance.dispatch["a"].private_ip}
+- Backend B: ${aws_instance.dispatch["b"].private_ip}
+- Backend C: ${aws_instance.dispatch["c"].private_ip}
+
+Ver estado:
+curl http://$KONG_PUBLIC_IP:8001/upstreams/backend-cluster/health" \
+        --region "$REGION" && touch "$ALERT_SENT_FILE"
+      log "[ALERT] Notificación de degradación enviada"
+    fi
+
+  elif [ "$HEALTHY" -eq 0 ] && [ "$TOTAL" -gt 0 ]; then
+    log "[CRITICAL] Todos los backends caídos"
+    /usr/local/bin/aws sns publish \
+      --topic-arn "$SNS_TOPIC_ARN" \
+      --subject "🚨 CRÍTICO: Sistema Completamente Caído" \
+      --message "ALERTA: 0 de $TOTAL backends operativos.
+
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP
+
+Acciones recomendadas:
+1. Verificar logs de backends
+2. Reiniciar servicios Django
+3. Verificar conectividad" \
+      --region "$REGION"
+
+  else
+    if [ -f "$ALERT_SENT_FILE" ]; then
+      rm -f "$ALERT_SENT_FILE"
+      /usr/local/bin/aws sns publish \
+        --topic-arn "$SNS_TOPIC_ARN" \
+        --subject "✅ RECUPERACIÓN: Sistema Operativo Normal" \
+        --message "El sistema volvió a la normalidad.
+
+Backends activos: $HEALTHY/$TOTAL
+Timestamp: $(date)
+IP Kong: $KONG_PUBLIC_IP" \
+        --region "$REGION"
+      log "[RECOVERY] Notificación de recuperación enviada"
+    fi
+  fi
+
+  sleep 30
+done
+MONITOR
+
+chmod +x /opt/kong/monitor_health.sh
+echo "[MONITOR] Script de monitoreo creado" | tee -a /var/log/kong-setup.log
+
+cat > /etc/systemd/system/kong-monitor.service <<'SERVICE'
+[Unit]
+Description=Kong Backend Health Monitor (SNS Alerts)
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+ExecStart=/opt/kong/monitor_health.sh
+Restart=always
+RestartSec=10
+StandardOutput=append:/var/log/kong-monitor.log
+StandardError=append:/var/log/kong-monitor.log
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+systemctl daemon-reload
+systemctl enable kong-monitor.service
+systemctl start kong-monitor.service
+echo "[MONITOR] Health monitor iniciado" | tee -a /var/log/kong-setup.log
+# --- FIN Monitor SNS ---
+
+# Crear archivo de estado
+echo "READY" > /tmp/kong_ready
+echo "[COMPLETE] Setup finalizado - $(date)" | tee -a /var/log/kong-setup.log
 
 # Crear archivo de estado
 echo "READY" > /tmp/kong_ready
