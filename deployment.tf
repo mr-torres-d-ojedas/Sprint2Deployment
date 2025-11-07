@@ -298,10 +298,10 @@ echo "[MIGRATE] OK" | tee -a /var/log/backend.log
 /apps/Sprint2/venv/bin/python populateDespachos.py | tee -a /var/log/backend.log || true
 echo "[POPULATE] OK" | tee -a /var/log/backend.log
 
-# Crear servicio systemd para Django
+# Crear servicio systemd para Django con auto-recuperación agresiva
 cat > /etc/systemd/system/django-backend.service <<'SERVICE'
 [Unit]
-Description=Django Backend Service (Sprint2)
+Description=Django Backend Service (Sprint2) - Auto-Recovery Enabled
 After=network.target
 Wants=network-online.target
 
@@ -312,38 +312,134 @@ WorkingDirectory=/apps/Sprint2
 Environment="DATABASE_HOST=${aws_instance.database.private_ip}"
 Environment="PATH=/apps/Sprint2/venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 ExecStart=/apps/Sprint2/venv/bin/python manage.py runserver 0.0.0.0:8080
+
+# Auto-recuperación: reinicia siempre que falle
 Restart=always
-RestartSec=10
+RestartSec=5
+
+# Reintentos ilimitados (sin límite de reintentos)
+StartLimitInterval=0
+StartLimitBurst=0
+
+# Timeout para inicio del servicio
+TimeoutStartSec=60
+
+# Si el proceso muere por cualquier razón, reiniciar
+# Esto incluye: SIGKILL, SIGTERM, crash por memoria, etc.
+KillMode=mixed
+KillSignal=SIGTERM
+SendSIGKILL=yes
+TimeoutStopSec=30
+
+# Logs
 StandardOutput=append:/var/log/django.log
 StandardError=append:/var/log/django.log
 
-# Configuración de reintentos
-StartLimitInterval=0
-StartLimitBurst=0
+# Prioridad normal
+Nice=0
+
+# Límites de recursos (para evitar consumo excesivo)
+# Memoria máxima: 500MB (ajustar según necesidad)
+MemoryMax=500M
+# Tareas máximas: 100
+TasksMax=100
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
 
-# Recargar systemd y habilitar el servicio
+# Crear watchdog que monitorea la salud del servicio cada 10 segundos
+cat > /opt/watchdog-django.sh <<'WATCHDOG'
+#!/bin/bash
+# Watchdog para Django - Verifica que el servicio esté respondiendo
+
+LOG="/var/log/django-watchdog.log"
+SERVICE="django-backend.service"
+HEALTH_URL="http://localhost:8080/despachos/reporte"
+MAX_FAILURES=3
+FAILURE_COUNT=0
+
+log() {
+  echo "[$(date +'%%F %%T')] $*" | tee -a "$LOG"
+}
+
+log "🔍 Django Watchdog iniciado"
+
+while true; do
+  # Verificar si el servicio está activo
+  if ! systemctl is-active --quiet "$SERVICE"; then
+    log "⚠️  Servicio $SERVICE no está activo, systemd debería reiniciarlo automáticamente"
+    FAILURE_COUNT=0
+    sleep 10
+    continue
+  fi
+
+  # Verificar si el endpoint responde
+  HTTP_CODE=$(curl -s -o /dev/null -w "%%{http_code}" --max-time 5 "$HEALTH_URL" 2>/dev/null || echo "000")
+  
+  if [ "$HTTP_CODE" == "200" ] || [ "$HTTP_CODE" == "302" ]; then
+    if [ $FAILURE_COUNT -gt 0 ]; then
+      log "✅ Servicio recuperado (HTTP $HTTP_CODE)"
+    fi
+    FAILURE_COUNT=0
+  else
+    FAILURE_COUNT=$((FAILURE_COUNT + 1))
+    log "❌ Fallo de salud $FAILURE_COUNT/$MAX_FAILURES (HTTP $HTTP_CODE)"
+    
+    if [ $FAILURE_COUNT -ge $MAX_FAILURES ]; then
+      log "🔄 Reiniciando servicio por fallas consecutivas"
+      systemctl restart "$SERVICE"
+      FAILURE_COUNT=0
+      sleep 15
+    fi
+  fi
+  
+  sleep 10
+done
+WATCHDOG
+
+chmod +x /opt/watchdog-django.sh
+
+# Crear servicio systemd para el watchdog
+cat > /etc/systemd/system/django-watchdog.service <<'WATCHSERVICE'
+[Unit]
+Description=Django Health Watchdog
+After=django-backend.service
+Wants=django-backend.service
+
+[Service]
+Type=simple
+ExecStart=/opt/watchdog-django.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+WATCHSERVICE
+
+# Recargar systemd y habilitar servicios
 systemctl daemon-reload
 systemctl enable django-backend.service
+systemctl enable django-watchdog.service
 systemctl start django-backend.service
-echo "[SYSTEMD] Django service habilitado y ejecutándose" | tee -a /var/log/backend.log
+systemctl start django-watchdog.service
 
-# Verificar que el servicio esté corriendo
+echo "[SYSTEMD] Django service y watchdog habilitados y ejecutándose" | tee -a /var/log/backend.log
+
+# Verificar que ambos servicios estén corriendo
 sleep 5
 systemctl status django-backend.service --no-pager | tee -a /var/log/backend.log
+systemctl status django-watchdog.service --no-pager | tee -a /var/log/backend.log
 
 # Crear archivo de estado para Kong
 echo "READY" > /tmp/backend_ready
-echo "[COMPLETE] Backend ${each.key} iniciado - $(date)" | tee -a /var/log/backend.log
+echo "[COMPLETE] Backend ${each.key} iniciado con auto-recuperación - $(date)" | tee -a /var/log/backend.log
 EOT
 
   depends_on = [aws_instance.database]
   tags = merge(local.common_tags, {
     Name = "${var.project_prefix}-backend-${each.key}"
-    Role = "backend"                       # <- Tag para discovery
+    Role = "backend"
   })
 }
 
@@ -797,6 +893,13 @@ output "instructions" {
    ✅ Elimina instancias que se apaguen o terminen
    ✅ Usa IPs privadas (no afecta cambio de IP pública)
 
+🛡️  AUTO-RECUPERACIÓN DE BACKENDS:
+   ✅ Systemd reinicia automáticamente si Django se cae (cada 5 segundos)
+   ✅ Watchdog monitorea salud del endpoint cada 10 segundos
+   ✅ Si 3 health checks fallan consecutivas, fuerza restart
+   ✅ Protección contra DDOS: límite de memoria (500MB) y tareas (100)
+   ✅ Reintentos ilimitados (no se rinde nunca)
+
 🖥️  Backends descubiertos automáticamente:
    Backend A: ${aws_instance.dispatch["a"].private_ip}:8080
    Backend B: ${aws_instance.dispatch["b"].private_ip}:8080
@@ -829,6 +932,39 @@ output "instructions" {
    # Verificar servicio de discovery
    systemctl status kong-discovery
 
+🔧 MONITOREAR AUTO-RECUPERACIÓN (en cada backend):
+   # Ver estado del servicio Django
+   systemctl status django-backend.service
+   
+   # Ver logs de Django
+   tail -f /var/log/django.log
+   
+   # Ver logs del watchdog
+   tail -f /var/log/django-watchdog.log
+   
+   # Ver cantidad de reinicios
+   systemctl show django-backend.service | grep NRestarts
+   
+   # Forzar reinicio manual (para pruebas)
+   systemctl restart django-backend.service
+
+🧪 PROBAR AUTO-RECUPERACIÓN:
+   1. Simular caída de Django:
+      ssh ubuntu@<backend-ip>
+      sudo systemctl kill -s SIGKILL django-backend.service
+      
+   2. Observar logs:
+      tail -f /var/log/django.log
+      tail -f /var/log/django-watchdog.log
+      
+   3. El servicio debe reiniciarse en ~5 segundos
+   4. Kong detectará el reinicio en el siguiente health check (~10s)
+   
+   5. Simular DDOS (saturar el backend):
+      ab -n 10000 -c 100 http://<backend-ip>:8080/despachos/reporte
+      
+   6. Si Django se cae, debe reiniciarse automáticamente
+
 🧪 PROBAR DISCOVERY:
    1. Detén un backend: aws ec2 stop-instances --instance-ids <id>
    2. Espera 30-60 segundos (ciclo de discovery + health check)
@@ -836,11 +972,14 @@ output "instructions" {
    4. El backend detenido debe desaparecer automáticamente
    5. Reinicia el backend y debe reaparecer en ~30-60 segundos
 
-📝 NOTAS:
+📝 NOTAS DE DISPONIBILIDAD:
    - Kong tarda ~3-5 minutos en estar completamente operativo
    - El discovery se ejecuta cada 30 segundos
-   - Solo se descubren instancias con tags: Project=${local.project_name} y Role=backend
-   - Las IPs privadas no cambian aunque reinicies las instancias (a menos que las termines)
+   - Watchdog verifica salud cada 10 segundos
+   - Systemd reinicia Django en 5 segundos si se cae
+   - Límite de memoria: 500MB por backend (ajustar si es necesario)
+   - Límite de tareas: 100 concurrentes por backend
+   - Los backends NUNCA dejan de intentar reiniciarse (StartLimitBurst=0)
 
 INSTRUCTIONS
 }
