@@ -276,6 +276,12 @@ cd /apps
 git clone ${local.repository}
 cd Sprint2
 
+PUBLIC_IP=$(curl -s http://169.254.169.254/latest/meta-data/public-ipv4)
+
+sed -i "s|LOGOUT_REDIRECT_URL = .*|LOGOUT_REDIRECT_URL = \"https://dev-4noubspfzqibyz5d.us.auth0.com/v2/logout?returnTo=http%3A%2F%2F$${PUBLIC_IP}:8080\"|g" /apps/Sprint2/provesi/settings.py
+
+echo "[SETTINGS] LOGOUT_REDIRECT_URL actualizado con IP pública $${PUBLIC_IP}" | tee -a /var/log/backend.log
+
 # Crear entorno virtual
 python3 -m venv /apps/Sprint2/venv
 
